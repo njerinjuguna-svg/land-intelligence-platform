@@ -1,0 +1,52 @@
+name,organisation,tier,url,license,redistribution_allowed,api_available,notes
+KNBS,Kenya National Bureau of Statistics,1,https://www.knbs.or.ke,GoK open data,yes,no,Census population and administrative boundaries
+IEBC,Independent Electoral and Boundaries Commission,1,https://www.iebc.or.ke,GoK open data,yes,no,Ward and constituency boundaries
+Ministry of Education,Government of Kenya,1,https://www.education.go.ke,GoK open data,yes,no,School registry with locations
+KMHFL,Ministry of Health Kenya Master Health Facility List,1,https://kmhfl.health.go.ke,GoK open data,yes,yes,Authoritative health facility list with coordinates
+WRA,Water Resources Authority,1,https://wra.go.ke,GoK by request,caution,no,Rivers basins boreholes permits
+KMD,Kenya Meteorological Department,1,https://meteo.go.ke,GoK by request,caution,no,Station rainfall and temperature records
+KWS,Kenya Wildlife Service,1,https://www.kws.go.ke,GoK by request,caution,no,Parks reserves and corridors
+KFS,Kenya Forest Service,1,https://www.kenyaforestservice.org,GoK by request,caution,no,Gazetted forest boundaries
+KeNHA,Kenya National Highways Authority,1,https://kenha.co.ke,GoK by request,caution,no,Highway network for validation
+Kenya Railways,Kenya Railways Corporation,1,https://krc.co.ke,GoK by request,caution,no,SGR and MGR lines and stations
+KCAA,Kenya Civil Aviation Authority,1,https://www.kcaa.or.ke,GoK by request,caution,no,Licensed aerodromes
+KPA,Kenya Ports Authority,1,https://www.kpa.co.ke,GoK by request,caution,no,Sea and lake ports
+Kenya Power,Kenya Power and Lighting Company,1,https://www.kplc.co.ke,by request,no,no,Distribution network. Request formally; use nightlights proxy meanwhile
+KETRACO,Kenya Electricity Transmission Company,1,https://www.ketraco.co.ke,by request,caution,no,Transmission lines
+REREC,Rural Electrification and Renewable Energy Corporation,1,https://www.rerec.co.ke,by request,caution,no,Rural electrification projects
+Communications Authority,Communications Authority of Kenya,1,https://www.ca.go.ke,by request,no,no,Coverage maps. Likely not redistributable in paid product; verify in writing
+NDMA,National Drought Management Authority,1,https://ndma.go.ke,GoK open data,yes,no,Drought early warning bulletins
+CBK,Central Bank of Kenya,1,https://www.centralbank.go.ke,GoK open data,yes,no,Licensed banks and microfinance list
+County Governments,47 county governments,1,varies,by request,caution,no,Zoning physical plans markets. Engage per pilot county
+WASREB,Water Services Regulatory Board,1,https://wasreb.go.ke,GoK open data,yes,no,Water utility performance and coverage areas
+Copernicus DEM,European Space Agency,2,https://dataspace.copernicus.eu,free with attribution,yes,yes,GLO-30 elevation 30 m
+SRTM,NASA / USGS,2,https://earthexplorer.usgs.gov,public domain,yes,yes,Backup DEM 30 m
+Sentinel-2,ESA Copernicus,2,https://dataspace.copernicus.eu,free and open,yes,yes,10 m optical imagery
+Landsat,USGS / NASA,2,https://earthexplorer.usgs.gov,public domain,yes,yes,Backup optical imagery
+ESA WorldCover,European Space Agency,2,https://esa-worldcover.org,CC-BY-4.0,yes,yes,10 m land cover 2021
+GHSL,European Commission JRC,2,https://human-settlement.emergency.copernicus.eu,free with attribution,yes,no,Built-up surface and settlement epochs
+JRC Global Surface Water,European Commission JRC,2,https://global-surface-water.appspot.com,free with attribution,yes,yes,Water occurrence 1984 to present
+VIIRS Nightlights,NOAA Earth Observation Group,2,https://eogdata.mines.edu,free with attribution,yes,no,SUPERSEDED - NOT THE SOURCE ACTUALLY USED. EOG moved OpenID access to paid subscribers mid-build (eogauth returns 403, eogdata 401), so VNL v2.2 is no longer reachable programmatically on a free account. demographics.nightlights was built from NASA Black Marble instead. Kept for provenance; do not select for new work
+NASA Black Marble,NASA / University of Maryland,2,https://ladsweb.modaps.eosdis.nasa.gov,free and open,yes,yes,VNP46A4 annual BRDF-adjusted nightlights ~500 m. THE SOURCE demographics.nightlights ACTUALLY USES. ArchiveSet 5200 (not 5000). Subdataset AllAngle_Composite_Snow_Free. v2.0 stores radiance as float so gas flares above 6553.5 stop saturating. No commercial restriction - chosen over Google Earth Engine whose free tier is noncommercial only
+Impact Observatory,Impact Observatory / Microsoft / Esri,2,https://registry.opendata.aws/io-lulc/,CC-BY-4.0,yes,yes,10 m annual LULC 9-class from Sentinel-2. Commercial use permitted with attribution. ANNUAL unlike ESA WorldCover which stopped at 2021. Kept ALONGSIDE WorldCover which has 11 classes incl mangroves. NOT temporally consistent - yearly snapshots only, change layer is pending_review. etl_29 inserts this row at runtime so the live database had it before this catalogue did
+Digital Earth Africa,Digital Earth Africa,2,https://www.digitalearthafrica.org,CC-BY-4.0,yes,yes,Built the gm_s2_annual Sentinel-2 geomedian that satellite.ndvi is computed from. NDVI previously attributed to the bare Sentinel-2 row which understates whose product it is. Their own spec warns the Landsat NDVI climatology is unreliable over equatorial Africa which is why the Sentinel-2 geomedian was chosen
+NASA POWER,NASA,2,https://power.larc.nasa.gov,public domain,yes,yes,Solar temperature wind point API
+ERA5,ECMWF Copernicus Climate,2,https://cds.climate.copernicus.eu,free with attribution,yes,yes,Reanalysis climate grids
+NASA FIRMS,NASA,2,https://firms.modaps.eosdis.nasa.gov,public domain,yes,yes,Active fire archive
+USGS Earthquakes,USGS,2,https://earthquake.usgs.gov,public domain,yes,yes,Seismic event catalogue
+WDPA,UNEP-WCMC Protected Planet,2,https://www.protectedplanet.net,no commercial redistribution,no,yes,Backup only. Use KWS as primary for paid product
+HydroSHEDS,WWF,2,https://www.hydrosheds.org,free with attribution,yes,no,Rivers basins flow derived from SRTM
+HDX,UN OCHA Humanitarian Data Exchange,2,https://data.humdata.org,varies per dataset,check each,yes,Convenient mirror for admin and population layers
+WPDx,Water Point Data Exchange,2,https://www.waterpointdata.org,CC-BY-4.0,yes,yes,Crowdsourced and government water points
+CHIRPS,UCSB Climate Hazards Center,3,https://www.chc.ucsb.edu/data/chirps,public domain,yes,no,Rainfall grids 1981 to present 5 km
+iSDAsoil,iSDA Africa,3,https://www.isda-africa.com/isdasoil,CC-BY-4.0,yes,yes,30 m African soil properties. Core soil source
+SoilGrids,ISRIC World Soil Information,3,https://soilgrids.org,CC-BY-4.0,yes,yes,250 m global soil backup
+WorldPop,University of Southampton,3,https://www.worldpop.org,CC-BY-4.0,yes,yes,100 m gridded population
+Global Solar Atlas,World Bank ESMAP,3,https://globalsolaratlas.info,CC-BY-4.0,yes,no,Solar resource grids
+Global Wind Atlas,World Bank DTU,3,https://globalwindatlas.info,CC-BY-4.0,yes,no,Wind resource grids
+Energydata.info,World Bank,3,https://energydata.info,CC-BY-4.0 mostly,yes,no,Africa grid lines mirror
+OpenStreetMap,OSM contributors via Geofabrik,4,https://download.geofabrik.de,ODbL-1.0,share-alike conditions,yes,Roads POIs buildings. Derived data must respect ODbL
+OpenCellID,Unwired Labs,4,https://opencellid.org,CC-BY-SA-4.0,share-alike conditions,yes,Cell tower positions. Share-alike risk in paid product
+healthsites.io,Healthsites.io,4,https://healthsites.io,ODbL-1.0,share-alike conditions,yes,Health facility backup
+Geocode Spatial Solutions,internal,5,https://geocodespatial.co.ke,proprietary,internal,no,All derived products: slope TWI buffers scores flood proxy
+Client land companies,platform clients,5,n/a,client agreement,internal,no,Parcel boundaries supplied at onboarding

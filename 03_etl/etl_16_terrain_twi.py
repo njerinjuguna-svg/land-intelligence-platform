@@ -1,0 +1,343 @@
+"""
+============================================================================
+ETL 16 - TERRAIN WETNESS INDEX / TWI (terrain.twi, ~90 m) - terrain step 4
+Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+What this script does:
+  Estimates, for every ~90 m patch of Kenya, how prone it is to being wet, an
+  interim flood/waterlogging proxy, and saves it as terrain.twi. High TWI = a
+  low, flat spot that lots of upstream land drains into (valley bottoms, flood
+  plains). Low TWI = a steep or high spot that sheds water (ridges, hillsides).
+
+What TWI actually is:
+  TWI = ln( a / tan(slope) )
+    a     = how much upslope land drains through this spot per unit width
+            (the "specific catchment area"),
+    slope = how steep this spot is.
+  Big drainage area + gentle slope = water collects = high TWI.
+
+Why ~90 m and not 30 m:
+  Working out where water flows means simulating drainage across the whole
+  country, which is heavy. At 30 m that is 1.28 billion cells. We shrink the
+  DEM to ~90 m first (about 143 million cells), which is plenty for a flood
+  PROXY (the catalogue itself calls terrain.twi a proxy until real flood maps
+  arrive) and runs in minutes instead of hours. You chose this trade-off.
+
+The water-flow steps (done by pysheds):
+  1. fill_pits / fill_depressions / resolve_flats: patch tiny holes and dead
+     flats in the DEM so simulated water never gets stuck in a 1-pixel trap.
+  2. flowdir: for each cell, which way is downhill.
+  3. accumulation: follow those arrows and count how many cells drain through
+     each cell. That count, made per-unit-width, is 'a'.
+
+New tool needed (install once, venv active):
+  pip install pysheds
+  (pysheds is the standard open-source hydrology library; no license limits.)
+
+Note: this is the most involved script in the terrain set. If pysheds installs
+or behaves oddly on the first run, tell me the message and we adjust, just like
+we did with slope.
+
+How to run (from 03_etl with venv active, after: pip install pysheds):
+  python etl_16_terrain_twi.py
+============================================================================
+"""
+
+import os
+import sys
+import gc
+import hashlib
+from pathlib import Path
+
+import numpy as np
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+# --- NumPy 2.x compatibility shim for pysheds 0.5 -------------------------
+# pysheds 0.5 predates NumPy 2.0 and still calls a few names NumPy has since
+# removed (e.g. np.in1d). We cannot downgrade NumPy because rasterio needs 2.x,
+# so we restore the old names as aliases of their modern replacements. Only
+# fills a name in if it is genuinely missing, so it is safe.
+for _old, _new in [("in1d", "isin"), ("bool8", "bool_"), ("float_", "float64"),
+                   ("int0", "intp"), ("uint0", "uintp"), ("alltrue", "all"),
+                   ("sometrue", "any")]:
+    if not hasattr(np, _old) and hasattr(np, _new):
+        setattr(np, _old, getattr(np, _new))
+# --------------------------------------------------------------------------
+
+try:
+    import rasterio
+    from rasterio.windows import Window
+    from rasterio.warp import reproject, Resampling
+    from rasterio.shutil import copy as rio_copy
+except ImportError:
+    sys.exit("ERROR: rasterio missing. With venv active: pip install rasterio")
+
+try:
+    from pysheds.grid import Grid
+except ImportError:
+    sys.exit("ERROR: pysheds is not installed. With the venv active run:\n"
+             "    pip install pysheds\n"
+             "then run this script again.")
+
+BASE = Path(__file__).resolve().parent
+PROJECT = BASE.parent
+PIPELINE = "etl_16_terrain_twi"
+
+COG_DIR = PROJECT / "06_rasters" / "cog" / "terrain"
+COG_DIR.mkdir(parents=True, exist_ok=True)
+COG_NAME = "terrain_twi_derived_glo30_90m.tif"
+COG_PATH = COG_DIR / COG_NAME
+DEM90_PATH = BASE / "data" / "raw" / "terrain" / "_dem90_tmp.tif"
+TMP_PATH = BASE / "data" / "raw" / "terrain" / "_twi_tmp.tif"
+
+FACTOR = 3                   # 30 m -> ~90 m (3x coarser)
+OUT_NODATA_I16 = -32768
+SCALE = 0.01                 # stored value * 0.01 = TWI (0.01 precision)
+M_PER_DEG = 111320.0
+MIN_SLOPE_RAD = 0.001        # floor so tan(slope) never hits 0 on dead-flat land
+
+
+def md5_of(path, chunk=8 * 1024 * 1024):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+load_dotenv(BASE / ".env")
+pw = os.getenv("DB_PASSWORD")
+if not pw or pw == "put_your_password_here":
+    sys.exit("ERROR: edit the .env file and set DB_PASSWORD first.")
+
+url = (
+    f"postgresql+psycopg2://{os.getenv('DB_USER', 'postgres')}:{pw}"
+    f"@{os.getenv('DB_HOST', 'localhost')}:{os.getenv('DB_PORT', '5432')}"
+    f"/{os.getenv('DB_NAME', 'land_intelligence_kenya')}"
+)
+engine = create_engine(url)
+with engine.connect() as conn:
+    conn.execute(text("SELECT 1"))
+print("Connected to database:", os.getenv("DB_NAME", "land_intelligence_kenya"))
+
+with engine.begin() as conn:
+    run_id = conn.execute(text("""
+        INSERT INTO metadata.etl_runs (pipeline, started_at, run_status)
+        VALUES (:p, now(), 'running') RETURNING run_id
+    """), {"p": PIPELINE}).scalar()
+print(f"ETL run opened (run_id={run_id})")
+
+try:
+    # -----------------------------------------------------------------------
+    # Locate the DEM via the catalogue.
+    # -----------------------------------------------------------------------
+    with engine.connect() as conn:
+        dem_path = conn.execute(text("""
+            SELECT storage_url FROM metadata.raster_catalog
+            WHERE variable = 'elevation' AND status = 'active'
+            ORDER BY raster_id DESC LIMIT 1
+        """)).scalar()
+    if not dem_path or not Path(dem_path).exists():
+        raise SystemExit("DEM not found via catalogue. Run etl_14 first.")
+    print(f"DEM: {dem_path}")
+
+    # -----------------------------------------------------------------------
+    # 1. Shrink the DEM 30 m -> ~90 m (average downsample), same CRS (4326).
+    # -----------------------------------------------------------------------
+    print(f"Resampling DEM to ~90 m (factor {FACTOR}) ...")
+    with rasterio.open(dem_path) as src:
+        new_w = src.width // FACTOR
+        new_h = src.height // FACTOR
+        new_transform = src.transform * src.transform.scale(
+            src.width / new_w, src.height / new_h)
+        dem90 = np.empty((new_h, new_w), dtype="float32")
+        reproject(
+            source=rasterio.band(src, 1), destination=dem90,
+            src_transform=src.transform, src_crs=src.crs,
+            dst_transform=new_transform, dst_crs=src.crs,
+            resampling=Resampling.average,
+        )
+        src_nodata = src.nodata
+        crs = src.crs
+        new_px = new_transform.a          # ~ px*3 in degrees
+        new_py = -new_transform.e
+        out_top = new_transform.f
+        prof90 = {
+            "driver": "GTiff", "dtype": "float32", "count": 1,
+            "crs": crs, "transform": new_transform,
+            "width": new_w, "height": new_h,
+            "nodata": src_nodata if src_nodata is not None else -9999.0,
+            "tiled": True, "blockxsize": 512, "blockysize": 512,
+        }
+    if src_nodata is None:
+        # give ocean/edges an explicit nodata for pysheds to respect
+        dem90 = dem90.copy()
+    with rasterio.open(DEM90_PATH, "w", **prof90) as d:
+        d.write(dem90, 1)
+    print(f"90 m DEM: {new_w} x {new_h} px (~{new_w*new_h/1e6:.0f} million cells)")
+
+    # -----------------------------------------------------------------------
+    # 2. Hydrology with pysheds: condition the DEM, then flow accumulation.
+    # -----------------------------------------------------------------------
+    print("Conditioning DEM and computing flow accumulation (pysheds) ...")
+    grid = Grid.from_raster(str(DEM90_PATH))
+    dem_r = grid.read_raster(str(DEM90_PATH))
+    pit_filled = grid.fill_pits(dem_r)
+    flooded = grid.fill_depressions(pit_filled)
+    inflated = grid.resolve_flats(flooded)
+    fdir = grid.flowdir(inflated)
+    acc = grid.accumulation(fdir)          # count of upslope cells per cell
+
+    # Pull just what we need out of pysheds as float32 (half the memory of
+    # float64), grab the nodata mask, then RELEASE all the pysheds arrays so
+    # they are not sitting in RAM while we do the slope/TWI maths.
+    dem_arr = np.asarray(inflated, dtype="float32")
+    acc_arr = np.asarray(acc, dtype="float32")
+    dem_mask = (np.asarray(dem_r) == src_nodata) if src_nodata is not None else None
+    del grid, dem_r, pit_filled, flooded, inflated, fdir, acc
+    gc.collect()
+
+    # -----------------------------------------------------------------------
+    # 3. Slope (radians), latitude-aware metres. Done fully IN PLACE to keep
+    #    only a couple of full-country arrays alive at once.
+    # -----------------------------------------------------------------------
+    cell_y_m = float(new_py * M_PER_DEG)               # ~92.8 m, constant
+    rows = np.arange(new_h)
+    lat = out_top - (rows + 0.5) * new_py
+    cell_x_m = (new_px * M_PER_DEG * np.cos(np.radians(lat))).astype("float32")
+
+    gy, gx = np.gradient(dem_arr)                       # two float32 arrays
+    del dem_arr
+    gc.collect()
+    gx /= cell_x_m.reshape(-1, 1)                        # dz/dx  (reuse gx)
+    gy /= cell_y_m                                       # dz/dy  (reuse gy)
+    np.square(gx, out=gx)
+    np.square(gy, out=gy)
+    gx += gy                                             # dzdx^2 + dzdy^2
+    del gy
+    gc.collect()
+    np.sqrt(gx, out=gx)
+    np.arctan(gx, out=gx)                                # slope (radians) -> gx
+    np.maximum(gx, MIN_SLOPE_RAD, out=gx)               # floor so tan != 0
+    np.tan(gx, out=gx)                                   # tan(slope) -> gx
+
+    # -----------------------------------------------------------------------
+    # 4. Specific catchment area and TWI, reusing acc_arr in place.
+    #    a = (upslope cells + this cell) * cell length ; TWI = ln(a / tan(slope))
+    # -----------------------------------------------------------------------
+    cell_len_m = float(np.mean(cell_x_m))               # ~92.8 m mean width
+    acc_arr += 1.0
+    acc_arr *= cell_len_m                                # a -> acc_arr
+    acc_arr /= gx                                        # a / tan(slope)
+    del gx
+    gc.collect()
+    np.log(acc_arr, out=acc_arr)                         # TWI -> acc_arr
+    twi = acc_arr
+
+    if dem_mask is not None:
+        twi[dem_mask] = np.nan
+
+    # -----------------------------------------------------------------------
+    # 5. Write TWI as compact Int16 (scale 0.01) COG.
+    # -----------------------------------------------------------------------
+    out = np.full(twi.shape, OUT_NODATA_I16, dtype="int16")
+    valid = np.isfinite(twi)
+    out[valid] = np.rint(np.clip(twi[valid], -300, 300) * 100.0).astype("int16")
+    del twi, valid
+    gc.collect()
+
+    prof_out = dict(prof90)
+    prof_out.update(dtype="int16", nodata=OUT_NODATA_I16, bigtiff="YES")
+    with rasterio.open(TMP_PATH, "w", **prof_out) as dst:
+        dst.scales = (SCALE,)
+        dst.write(out, 1)
+
+    print("Converting TWI to COG ...")
+    if COG_PATH.exists():
+        COG_PATH.unlink()
+    rio_copy(str(TMP_PATH), str(COG_PATH), driver="COG",
+             compress="DEFLATE", predictor=2,
+             overview_resampling="average", BIGTIFF="YES")
+    TMP_PATH.unlink(missing_ok=True)
+    DEM90_PATH.unlink(missing_ok=True)
+
+    size_mb = COG_PATH.stat().st_size / 1_000_000
+    print(f"COG written: {COG_PATH.name}  ({size_mb:.0f} MB)")
+    checksum = md5_of(COG_PATH)
+
+    # -----------------------------------------------------------------------
+    # 6. Catalogue as a derived product (interim proxy -> confidence 3).
+    # -----------------------------------------------------------------------
+    with engine.connect() as conn:
+        source_id = conn.execute(text(
+            "SELECT source_id FROM metadata.sources WHERE name = 'Geocode Spatial Solutions'"
+        )).scalar()
+        dataset_id = conn.execute(text(
+            "SELECT dataset_id FROM metadata.datasets WHERE code = 'terrain.twi'"
+        )).scalar()
+    if source_id is None or dataset_id is None:
+        raise SystemExit("Geocode source or terrain.twi dataset missing. Run etl_04.")
+
+    with rasterio.open(COG_PATH) as s:
+        l, b, r, t = s.bounds.left, s.bounds.bottom, s.bounds.right, s.bounds.top
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            DELETE FROM metadata.raster_catalog
+            WHERE dataset_id = :did AND variable = 'twi'
+        """), {"did": dataset_id})
+        conn.execute(text("""
+            INSERT INTO metadata.raster_catalog
+                (dataset_id, name, variable, storage_url, format, pixel_size_m,
+                 band_count, nodata_value, temporal_start, temporal_end, bbox,
+                 checksum, source_id, source_date, confidence)
+            VALUES
+                (:did, :name, 'twi', :url, 'COG', :px,
+                 1, :nodata, DATE '2010-01-01', DATE '2018-12-31',
+                 ST_MakeEnvelope(:l, :b, :r, :t, 4326),
+                 :chk, :sid, CURRENT_DATE, 3)
+        """), {
+            "did": dataset_id,
+            "name": ("Topographic Wetness Index (interim flood proxy), Int16 "
+                     "scale 0.01, ~90 m, from Copernicus GLO-30 DEM via pysheds."),
+            "url": str(COG_PATH),
+            "px": round(new_px * M_PER_DEG, 1),
+            "nodata": OUT_NODATA_I16,
+            "l": l, "b": b, "r": r, "t": t,
+            "chk": checksum, "sid": source_id,
+        })
+        conn.execute(text("""
+            UPDATE metadata.datasets SET etl_status = 'ingested', updated_at = now()
+            WHERE code = 'terrain.twi'
+        """))
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'success', rows_out = 1
+            WHERE run_id = :id
+        """), {"id": run_id})
+
+    print(f"\nDONE. Run {run_id} logged as success.")
+    print(f"TWI catalogued: {COG_PATH}")
+    print("Verify in QGIS: add the TWI .tif. Valley bottoms, flood plains and "
+          "the Lake basins should glow high; ridges and hillsides stay low.")
+    print("Terrain trio complete: DEM + slope + TWI.")
+
+# BaseException, NOT Exception, and this is load-bearing.
+# This script's own guards raise SystemExit, and Ctrl+C raises
+# KeyboardInterrupt. Both inherit from BaseException, so an
+# `except Exception` handler never fires for them and the
+# metadata.etl_runs row is left at 'running' forever. That bug left 12
+# orphan rows across a month of work, including runs PROGRESS.md
+# documents as failures. The trailing `raise` is unchanged: this logs
+# the failure and then gets out of the way.
+except BaseException as exc:
+    for p in (TMP_PATH, DEM90_PATH):
+        p.unlink(missing_ok=True)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'failed', error_message = :e
+            WHERE run_id = :id
+        """), {"e": str(exc)[:2000], "id": run_id})
+    raise

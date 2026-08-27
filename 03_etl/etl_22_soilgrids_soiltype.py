@@ -1,0 +1,461 @@
+"""
+============================================================================
+ETL 22 - SOILGRIDS WRB SOIL TYPE (soils.soil_type) at 250 m
+Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+What this script does:
+  Fetches the most probable WRB Reference Soil Group for Kenya from SoilGrids
+  250 m, reprojects it to EPSG:4326, and catalogues it as soils.soil_type.
+
+WHY THIS IS NOT AN iSDA LAYER (the mistake this ETL exists to avoid):
+  Our catalogue defines soils.soil_type as a WRB TAXONOMY class. iSDAsoil,
+  which gave us pH and texture in etl_17, publishes soil PROPERTIES: numbers
+  like pH, clay percent, organic carbon. It does not publish taxonomy. Those
+  are different questions. A property says "this soil is 48% clay". A taxonomy
+  class says "this is a Vertisol", which carries a whole bundle of behaviour
+  with it: shrink-swell, cracking, poor drainage, difficult foundations.
+  Reaching for iSDA here would have produced a plausible-looking layer
+  answering the wrong question.
+
+WHY TAXONOMY EARNS ITS PLACE ALONGSIDE TEXTURE:
+  We already hold iSDA texture, and texture already flags heavy clay. So why
+  this too? Because a soil group is a diagnosis, not a measurement. Vertisols
+  are the black cotton soils that crack open in the dry season and swell in
+  the wet, wrecking foundations and road surfaces. Nitisols are the deep red
+  soils of the central highlands that grow Kenya's coffee and tea. Leptosols
+  are shallow soil over rock, where you cannot dig a pit latrine or a
+  foundation without hitting stone. Those are answers to "can I build here"
+  and "can I farm here" that a clay percentage alone does not give you.
+
+PROJECTION: MEASURED, NOT ASSUMED (v1 of this script assumed wrong)
+  v1 stated confidently that SoilGrids is served in Interrupted Goode
+  Homolosine, converted Kenya's bounds into metres, and looked them up in the
+  source grid. Run 52 disagreed: this endpoint reports EPSG:4326 at
+  172,800 x 67,200 pixels, which is 1/480 of a degree, about 232 m. Metre
+  coordinates near 1,500,000 fall far outside a raster whose axes run to 180,
+  so the window came out empty and the run stopped.
+
+  That failure was cheap only because the code checked. The lesson is the one
+  we already wrote down in session 5 and then did not apply here: ASK THE FILE
+  WHAT PROJECTION IT IS IN. This script now does, and handles both cases:
+     projected source  -> STAGE A fetches the native window, STAGE B warps it
+     geographic source -> STAGE A fetches the window, STAGE B just clips it,
+                          because there is nothing to reproject
+  The fetch-then-reproject split from etl_17 is still the right shape. It just
+  collapses to a clip when the source is already in lon/lat, which is the
+  faster and lossless path: no resampling of class codes at all.
+
+  When the source IS projected, the script also guards against Goode
+  Homolosine's interruptions (the projection cuts the world into lobes, and a
+  bounding box straddling a cut balloons to continental width) by comparing
+  the native window width against Kenya's real width.
+
+CATEGORICAL RULES, same as land cover:
+  Resampling and overviews are NEAREST throughout. The average of Nitisols and
+  Vertisols is not a soil.
+
+THE LEGEND IS VERIFIED, NOT TRUSTED:
+  Class codes run 0-29 in alphabetical order of soil group name. Rather than
+  take that on faith, the script prints the class histogram WITH NAMES and
+  checks for soils that cannot occur in Kenya. Cryosols form in permafrost.
+  Albeluvisols and Podzols are boreal and temperate. If those show up across
+  Kenya, the legend is shifted and the script says so instead of cataloguing
+  a mislabelled map. That is a test the data itself cannot fake.
+
+Licence: CC-BY-4.0 (ISRIC World Soil Information), commercial use fine with
+attribution.
+
+How to run (from 03_etl with venv active):
+  python etl_22_soilgrids_soiltype.py
+============================================================================
+"""
+
+import os
+import sys
+import time
+import hashlib
+import contextlib
+from pathlib import Path
+
+for _k in ("PROJ_LIB", "PROJ_DATA", "GDAL_DATA"):
+    os.environ.pop(_k, None)
+
+import numpy as np
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+try:
+    import rasterio
+    from rasterio.crs import CRS
+    from rasterio.windows import Window, from_bounds
+    from rasterio.vrt import WarpedVRT
+    from rasterio.enums import Resampling
+    from rasterio.warp import transform_bounds
+    from rasterio.shutil import copy as rio_copy
+except ImportError:
+    sys.exit("ERROR: rasterio missing. With venv active: pip install rasterio")
+
+BASE = Path(__file__).resolve().parent
+PROJECT = BASE.parent
+PIPELINE = "etl_22_soilgrids_soiltype"
+
+RAW_DIR = BASE / "data" / "raw" / "soils"
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+COG_DIR = PROJECT / "06_rasters" / "cog" / "soils"
+COG_DIR.mkdir(parents=True, exist_ok=True)
+
+SRC = "/vsicurl/https://files.isric.org/soilgrids/latest/data/wrb/MostProbable.vrt"
+# Kept only for reference. SoilGrids has historically been distributed in
+# Interrupted Goode Homolosine, and some ISRIC endpoints still are, so if this
+# script is ever pointed at one of those the projected code path below handles
+# it. The endpoint we use reports EPSG:4326 and is detected at runtime.
+IGH = ("+proj=igh +lat_0=0 +lon_0=0 +x_0=0 +y_0=0 "
+       "+datum=WGS84 +units=m +no_defs")
+
+NATIVE = RAW_DIR / "native_wrb.tif"
+TMP = RAW_DIR / "_soils_soil_type_tmp.tif"
+COG_NAME = "soils_soil_type_soilgrids_250m.tif"
+COG_PATH = COG_DIR / COG_NAME
+
+PAD_DEG = 0.05
+NODATA = 255
+STRIP = 512
+
+ATTRIB = ("SoilGrids 250 m v2.0, WRB most probable Reference Soil Group, "
+          "ISRIC World Soil Information, CC-BY-4.0. "
+          "Poggio et al. 2021, SOIL 7:217-240.")
+
+# WRB Reference Soil Groups, alphabetical, as SoilGrids codes them.
+WRB = [
+    "Acrisols", "Albeluvisols", "Alisols", "Andosols", "Arenosols",
+    "Calcisols", "Cambisols", "Chernozems", "Cryosols", "Durisols",
+    "Ferralsols", "Fluvisols", "Gleysols", "Gypsisols", "Histosols",
+    "Kastanozems", "Leptosols", "Lixisols", "Luvisols", "Nitisols",
+    "Phaeozems", "Planosols", "Plinthosols", "Podzols", "Regosols",
+    "Solonchaks", "Solonetz", "Stagnosols", "Umbrisols", "Vertisols",
+]
+
+# Soils that CANNOT meaningfully occur in equatorial Kenya. If the legend were
+# shifted by even one position these would light up, because the real classes
+# next to them (Andosols, Arenosols, Ferralsols) are common here. This is a
+# legend check the data cannot fake.
+IMPOSSIBLE_IN_KENYA = {"Cryosols", "Albeluvisols", "Podzols", "Chernozems",
+                       "Kastanozems"}
+
+# What Kenya should actually be made of, for orientation.
+EXPECTED_COMMON = ["Leptosols", "Ferralsols", "Acrisols", "Lixisols",
+                   "Luvisols", "Cambisols", "Nitisols", "Vertisols",
+                   "Arenosols", "Andosols", "Solonchaks", "Calcisols"]
+
+
+def md5_of(path, chunk=8 * 1024 * 1024):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+load_dotenv(BASE / ".env")
+pw = os.getenv("DB_PASSWORD")
+if not pw or pw == "put_your_password_here":
+    sys.exit("ERROR: edit the .env file and set DB_PASSWORD first.")
+
+engine = create_engine(
+    f"postgresql+psycopg2://{os.getenv('DB_USER', 'postgres')}:{pw}"
+    f"@{os.getenv('DB_HOST', 'localhost')}:{os.getenv('DB_PORT', '5432')}"
+    f"/{os.getenv('DB_NAME', 'land_intelligence_kenya')}")
+with engine.connect() as conn:
+    conn.execute(text("SELECT 1"))
+print("Connected to database:", os.getenv("DB_NAME", "land_intelligence_kenya"))
+
+with engine.begin() as conn:
+    run_id = conn.execute(text("""
+        INSERT INTO metadata.etl_runs (pipeline, started_at, run_status)
+        VALUES (:p, now(), 'running') RETURNING run_id
+    """), {"p": PIPELINE}).scalar()
+print(f"ETL run opened (run_id={run_id})")
+
+GDAL_ENV = dict(
+    GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
+    GDAL_HTTP_MULTIRANGE="NO",          # hard-won in session 4, do not change
+    GDAL_HTTP_MAX_RETRY="10",
+    GDAL_HTTP_RETRY_DELAY="2",
+    GDAL_HTTP_TIMEOUT="120",
+    GDAL_CACHEMAX=512,
+    CPL_VSIL_CURL_CACHE_SIZE=268435456,
+    VSI_CACHE="TRUE",
+    VSI_CACHE_SIZE=134217728,
+)
+
+try:
+    with engine.connect() as conn:
+        xmin, xmax, ymin, ymax = conn.execute(text("""
+            SELECT ST_XMin(e), ST_XMax(e), ST_YMin(e), ST_YMax(e)
+            FROM (SELECT ST_Extent(geom) AS e FROM admin.country) t
+        """)).one()
+        source_id = conn.execute(text(
+            "SELECT source_id FROM metadata.sources WHERE name = 'SoilGrids'"
+        )).scalar()
+        dataset_id = conn.execute(text(
+            "SELECT dataset_id FROM metadata.datasets "
+            "WHERE code = 'soils.soil_type'")).scalar()
+    if source_id is None or dataset_id is None:
+        raise SystemExit("SoilGrids source or soils.soil_type dataset missing. "
+                         "Run etl_04 first.")
+
+    xmin, xmax = float(xmin) - PAD_DEG, float(xmax) + PAD_DEG
+    ymin, ymax = float(ymin) - PAD_DEG, float(ymax) + PAD_DEG
+    print(f"Kenya bbox (padded): lon {xmin:.3f}..{xmax:.3f}, "
+          f"lat {ymin:.3f}..{ymax:.3f}")
+
+    # -----------------------------------------------------------------------
+    # STAGE A: fetch Kenya's window in the NATIVE projection, no warp
+    # -----------------------------------------------------------------------
+    if NATIVE.exists() and NATIVE.stat().st_size > 100_000:
+        print(f"\nSTAGE A: already have {NATIVE.name}, skipping download.")
+    else:
+        print(f"\nSTAGE A: fetch native window  <-  {SRC}")
+        with rasterio.Env(**GDAL_ENV):
+            with rasterio.open(SRC) as src:
+                print(f"    source: {src.width:,} x {src.height:,}, "
+                      f"{src.dtypes[0]}, nodata {src.nodata}")
+                print(f"    source crs: {str(src.crs)[:70]}")
+
+                # ASK THE FILE. Do not assume a projection: see the header.
+                src_crs = src.crs
+                geographic = src_crs is not None and src_crs.is_geographic
+                if geographic:
+                    print("    source is ALREADY lon/lat, so there is nothing "
+                          "to reproject.")
+                    print("    Stage B will clip rather than warp, which means "
+                          "class codes are")
+                    print("    never resampled at all. Better than the "
+                          "projected path, not worse.")
+                    bx0, by0, bx1, by1 = xmin, ymin, xmax, ymax
+                else:
+                    bx0, by0, bx1, by1 = transform_bounds(
+                        "EPSG:4326", src_crs, xmin, ymin, xmax, ymax,
+                        densify_pts=51)
+                    # INTERRUPTION CHECK, only meaningful for a projected
+                    # source. Goode Homolosine cuts the world into lobes, and a
+                    # bounding box straddling a cut balloons to continental
+                    # width, which would silently fetch a huge wrong region.
+                    width_m = bx1 - bx0
+                    expect_m = (xmax - xmin) * 111320 * 1.15
+                    print(f"    native window width {width_m/1000:,.0f} km "
+                          f"(expect roughly {expect_m/1000:,.0f} km)")
+                    if width_m > expect_m * 2:
+                        raise SystemExit(
+                            "The window is far wider in the native projection "
+                            "than Kenya is on the ground, which means the "
+                            "bounding box crosses a projection interruption. "
+                            "This simple window fetch is not valid. Stopping.")
+
+                win = from_bounds(bx0, by0, bx1, by1, src.transform)
+                win = win.round_offsets().round_lengths()
+                col_off = max(0, int(win.col_off))
+                row_off = max(0, int(win.row_off))
+                w = min(int(win.width), src.width - col_off)
+                h = min(int(win.height), src.height - row_off)
+                if w <= 0 or h <= 0:
+                    raise SystemExit("Empty Kenya window in the native grid.")
+                print(f"    Kenya window: {w:,} x {h:,} px "
+                      f"(~{abs(src.transform.a):.0f} m)")
+
+                prof = {
+                    "driver": "GTiff", "dtype": src.dtypes[0], "count": 1,
+                    "crs": src_crs,
+                    "transform": src.window_transform(
+                        Window(col_off, row_off, w, h)),
+                    "width": w, "height": h,
+                    "nodata": src.nodata if src.nodata is not None else NODATA,
+                    "tiled": True, "blockxsize": 512, "blockysize": 512,
+                    "compress": "DEFLATE", "bigtiff": "YES",
+                }
+                t0 = time.time()
+                with rasterio.open(NATIVE, "w", **prof) as dst:
+                    for r in range(0, h, STRIP):
+                        rh = min(STRIP, h - r)
+                        arr = None
+                        for attempt in range(1, 9):
+                            try:
+                                arr = src.read(1, window=Window(
+                                    col_off, row_off + r, w, rh))
+                                break
+                            except rasterio.errors.RasterioIOError:
+                                if attempt == 8:
+                                    raise
+                                print(f"    ... hiccup at rows {r}-{r+rh}, "
+                                      f"retry {attempt}", flush=True)
+                                time.sleep(min(3 * attempt, 15))
+                        dst.write(arr, 1, window=Window(0, r, w, rh))
+                        el = time.time() - t0
+                        frac = (r + rh) / h
+                        print(f"    fetch {r+rh}/{h} rows ({100*frac:5.1f}%)  "
+                              f"ETA {(el/frac - el)/60:.1f} min", flush=True)
+        print(f"    saved {NATIVE.name} "
+              f"({NATIVE.stat().st_size/1e6:.0f} MB)")
+
+    # -----------------------------------------------------------------------
+    # STAGE B: reproject the LOCAL file to EPSG:4326, nearest throughout
+    # -----------------------------------------------------------------------
+    print("\nSTAGE B: bring the local file to EPSG:4326 (nearest, categorical)")
+    hist = np.zeros(256, dtype="int64")
+    with contextlib.ExitStack() as stack:
+        src = stack.enter_context(rasterio.open(NATIVE))
+        src_nodata = src.nodata if src.nodata is not None else NODATA
+        if src.crs is not None and src.crs.is_geographic:
+            # Already lon/lat. Read straight from it: no warp, no resampling,
+            # so every class code survives exactly as published.
+            rd = src
+            print("    already EPSG:4326: clipping, not warping. Class codes "
+                  "pass through untouched.")
+        else:
+            rd = stack.enter_context(
+                WarpedVRT(src, crs="EPSG:4326",
+                          resampling=Resampling.nearest,
+                          src_nodata=src_nodata, nodata=src_nodata))
+            print("    warping from the native projection with NEAREST.")
+
+        win = from_bounds(xmin, ymin, xmax, ymax, rd.transform)
+        win = win.round_offsets().round_lengths()
+        c0 = max(0, int(win.col_off))
+        r0 = max(0, int(win.row_off))
+        w = min(int(win.width), rd.width - c0)
+        h = min(int(win.height), rd.height - r0)
+        if w <= 0 or h <= 0:
+            raise SystemExit("Empty window in stage B.")
+        px_deg = rd.transform.a
+        out_transform = rd.window_transform(Window(c0, r0, w, h))
+        print(f"    output grid: {w:,} x {h:,} px (~{px_deg*111320:.0f} m)")
+
+        prof = {
+            "driver": "GTiff", "dtype": "uint8", "count": 1,
+            "crs": "EPSG:4326", "transform": out_transform,
+            "width": w, "height": h, "nodata": NODATA,
+            "tiled": True, "blockxsize": 512, "blockysize": 512,
+            "compress": "DEFLATE", "bigtiff": "YES",
+        }
+        with rasterio.open(TMP, "w", **prof) as dst:
+            for r in range(0, h, STRIP):
+                rh = min(STRIP, h - r)
+                a = rd.read(1, window=Window(c0, r0 + r, w, rh))
+                out = np.full(a.shape, NODATA, dtype="uint8")
+                good = (a != src_nodata) & (a >= 0) & (a < len(WRB))
+                out[good] = a[good].astype("uint8")
+                dst.write(out, 1, window=Window(0, r, w, rh))
+                hist += np.bincount(out.ravel(), minlength=256)
+                del a, out, good
+
+    # -----------------------------------------------------------------------
+    # STAGE C: verify the legend, then COG and catalogue
+    # -----------------------------------------------------------------------
+    valid = int(hist.sum() - hist[NODATA])
+    if valid == 0:
+        raise SystemExit("Every pixel is nodata. Nothing was fetched correctly.")
+
+    print(f"\n  Soil groups over the window ({valid:,} classified pixels):")
+    print(f"  {'code':>5}  {'soil group':22}{'share':>9}")
+    impossible_share = 0.0
+    for code in np.nonzero(hist)[0]:
+        if code == NODATA:
+            continue
+        name = WRB[code] if code < len(WRB) else f"UNKNOWN {code}"
+        share = 100.0 * hist[code] / valid
+        flag = ""
+        if name in IMPOSSIBLE_IN_KENYA:
+            impossible_share += share
+            flag = "  <-- should not exist in Kenya"
+        print(f"  {code:>5}  {name:22}{share:>8.2f}%{flag}")
+
+    print(f"\n  legend sanity: soils that cannot occur in Kenya account for "
+          f"{impossible_share:.3f}% of pixels")
+    if impossible_share > 1.0:
+        raise SystemExit(
+            f"{impossible_share:.2f}% of Kenya is mapped as permafrost or "
+            f"boreal soils (Cryosols, Albeluvisols, Podzols, Chernozems, "
+            f"Kastanozems). The class legend is almost certainly shifted. "
+            f"Refusing to catalogue a mislabelled soil map.")
+    print("  Under 1% means the alphabetical 0-29 mapping is correct: if it "
+          "were shifted\n  even one position, the common Kenyan groups next to "
+          "them would spill into\n  these and light this check up.")
+
+    print("\n  Expected common Kenyan groups, for orientation: "
+          + ", ".join(EXPECTED_COMMON))
+
+    print("\n  Converting to COG (nearest overviews) ...")
+    if COG_PATH.exists():
+        COG_PATH.unlink()
+    rio_copy(str(TMP), str(COG_PATH), driver="COG",
+             compress="DEFLATE", overview_resampling="nearest")
+    TMP.unlink(missing_ok=True)
+    print(f"  COG: {COG_PATH.name} ({COG_PATH.stat().st_size/1e6:.1f} MB)")
+
+    with rasterio.open(COG_PATH) as s:
+        b = s.bounds
+
+    legend = ", ".join(f"{i}={n}" for i, n in enumerate(WRB))
+    with engine.begin() as conn:
+        conn.execute(text("""
+            DELETE FROM metadata.raster_catalog
+            WHERE dataset_id = :did AND variable = 'soil_type'
+        """), {"did": dataset_id})
+        conn.execute(text("""
+            INSERT INTO metadata.raster_catalog
+                (dataset_id, name, variable, storage_url, format, pixel_size_m,
+                 band_count, nodata_value, temporal_start, temporal_end, bbox,
+                 checksum, source_id, source_date, confidence)
+            VALUES
+                (:did, :name, 'soil_type', :url, 'COG', :px, 1, :nodata,
+                 DATE '2020-01-01', DATE '2020-12-31',
+                 ST_MakeEnvelope(:l, :b, :r, :t, 4326),
+                 :chk, :sid, DATE '2021-01-01', 3)
+        """), {
+            "did": dataset_id,
+            "name": (f"WRB most probable Reference Soil Group, SoilGrids 250 m "
+                     f"v2.0. Codes: {legend}. 255=nodata. Vertisols are the "
+                     f"black cotton soils (shrink-swell, poor foundations); "
+                     f"Nitisols are the deep red highland soils; Leptosols are "
+                     f"shallow soil over rock. " + ATTRIB),
+            "url": str(COG_PATH), "px": round(px_deg * 111320, 1),
+            "nodata": NODATA,
+            "l": float(b.left), "b": float(b.bottom),
+            "r": float(b.right), "t": float(b.top),
+            "chk": md5_of(COG_PATH), "sid": source_id,
+        })
+        conn.execute(text("""
+            UPDATE metadata.datasets SET etl_status='ingested', updated_at=now()
+            WHERE code = 'soils.soil_type'
+        """))
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'success', rows_out = 1
+            WHERE run_id = :id
+        """), {"id": run_id})
+
+    print(f"\nDONE. Run {run_id} logged as success.")
+    print("The strongest independent check available: Vertisols from this "
+          "layer should\ncoincide with heavy clay in soils_texture_class from "
+          "etl_17. Two different\nproducers, two different methods, one "
+          "physical reality. Nitisols should sit\nover the central highlands "
+          "coffee and tea belt, Andosols around Mt Kenya, the\nAberdares and "
+          "Mt Elgon, and Solonchaks (salt-affected) near Turkana.")
+
+# BaseException, NOT Exception, and this is load-bearing.
+# This script's own guards raise SystemExit, and Ctrl+C raises
+# KeyboardInterrupt. Both inherit from BaseException, so an
+# `except Exception` handler never fires for them and the
+# metadata.etl_runs row is left at 'running' forever. That bug left 12
+# orphan rows across a month of work, including runs PROGRESS.md
+# documents as failures. The trailing `raise` is unchanged: this logs
+# the failure and then gets out of the way.
+except BaseException as exc:
+    TMP.unlink(missing_ok=True)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'failed', error_message = :e
+            WHERE run_id = :id
+        """), {"e": str(exc)[:2000], "id": run_id})
+    raise

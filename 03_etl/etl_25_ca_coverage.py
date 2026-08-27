@@ -1,0 +1,793 @@
+r"""
+============================================================================
+ETL 25 - connectivity.coverage from the Communications Authority of Kenya
+Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+WHAT THIS IS, AND WHAT IT IS NOT
+  The catalogue assumed CA coverage maps were "likely not redistributable"
+  and that we would have to derive coverage ourselves from towers. That was
+  an ASSUMPTION, never tested, and it is wrong: the CA runs a public ArcGIS
+  Hub geoportal with queryable FeatureServer endpoints.
+
+  But the data is not what the catalogue expected either. These are NOT
+  signal propagation contours. They are the 7,134 SUBLOCATION boundaries with
+  a coverage PERCENTAGE per technology:
+
+      ABAKAILE,  Garissa,  64.89% 4G
+      ABALATIRO, Garissa,  99.02% 4G
+      ABDI WAKO, Wajir,   100.00% 4G
+
+  So the honest product statement is "the sublocation containing this parcel
+  is about two-thirds 4G-covered", NEVER "this parcel has 4G". Schema v1.4
+  adds coverage_pct and the admin-unit columns so the number survives intact
+  instead of being bucketed into a signal_class that was never measured.
+
+  Pair it with distance-to-nearest-tower from connectivity.towers, which IS
+  point-specific. Neither answers the question alone.
+
+LICENSING - READ BEFORE ANY COMMERCIAL USE
+  Every CA item on the portal has licenseInfo = null and accessInformation =
+  null. There is NO declared licence. Public availability on a government
+  open-data portal is not the same as a grant of commercial redistribution
+  rights, so this loads at confidence 3 with commercial_ok = FALSE recorded
+  against the source, exactly as WDPA does.
+  ACTION FOR NJERI: write to the CA (info@ca.go.ke) asking for written
+  confirmation of reuse terms for the ICT Services Coverage Geo-Portal
+  layers. One request to the regulator beats three to the operators.
+
+CURRENCY
+  The 4G layer's last data edit was 2023-08-30. The portal also carries a
+  "Mobile Broadband Coverage 2024" page. Whatever each layer reports as its
+  edit date is written to source_date, so staleness is visible per row rather
+  than assumed.
+
+METHOD
+  ArcGIS FeatureServer query API, paginated at the service's own
+  maxRecordCount (2000), requesting outSR=4326 so the server reprojects from
+  Web Mercator rather than us. GeoJSON out. No key, no auth.
+
+  STEP 1 PROBES EVERY LAYER AND PRINTS WHAT IT FOUND BEFORE LOADING ANYTHING.
+  Sessions 5 and 6 both lost hours to assumed schemas and assumed CRSs. The
+  probe costs one request per layer.
+
+How to run (from 03_etl with venv active, after 05_schema_update_v1.4.sql):
+  python etl_25_ca_coverage.py
+  python etl_25_ca_coverage.py --probe-only
+============================================================================
+"""
+
+import os
+import sys
+import json
+import time
+import http.client
+import urllib.parse
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+for _k in ("PROJ_LIB", "PROJ_DATA", "GDAL_DATA"):
+    os.environ.pop(_k, None)
+
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+try:
+    import geopandas as gpd
+    from shapely.geometry import shape, MultiPolygon
+except ImportError as e:
+    sys.exit(f"ERROR: missing dependency ({e}). With venv active: "
+             f"pip install geopandas shapely")
+
+BASE = Path(__file__).resolve().parent
+PIPELINE = "etl_25_ca_coverage"
+RAW_DIR = BASE / "data" / "raw" / "connectivity"
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+CA_ROOT = ("https://services3.arcgis.com/J6eHAgu5RdVbyKiM/arcgis/rest/"
+           "services")
+# PAGE SIZE IS A RELIABILITY SETTING, NOT A SPEED ONE.
+# The service allows 2,000 features per page, but with geometry that is a
+# ~24 MB response, and run 66 died on a page that arrived 10 MB short. Asking
+# for 500 makes each request roughly 6 MB: more round trips, but each one
+# small enough to survive a link that drops for a second.
+PAGE = 500
+TIMEOUT = 180
+
+# WHICH LAYERS. The CA publishes combined (all three operators) and
+# per-operator layers, plus "uncovered" complements. We take the COMBINED
+# covered layers as the primary signal, because a buyer cares whether there
+# is service, not whose. Per-operator 4G is loaded too, since operator choice
+# genuinely matters to some buyers.
+#
+# 'uncovered' layers are deliberately NOT loaded: they are the complement of
+# the same sublocation set, so loading both would double-count area and
+# invite a query that sums to 200%.
+# CANDIDATES, NOT A FIXED LIST. The first probe showed the CA's layers were
+# published piecemeal over several years and are not interchangeable: the
+# headline 3G layer carries no percentage field at all, and airtel_4G carries
+# none either. So each (technology, operator) slot lists candidates in order
+# of preference and we take the first one that actually has what we need.
+# Nothing is assumed; the probe decides.
+LAYER_CANDIDATES = [
+    # technology, operator,     candidate services in order of preference
+    ("2g", "all",       ["airtel_safaricom_telkom_2G1"]),
+    ("3g", "all",       ["airtel_safaricom_telkom_3G",
+                         "T7d_airtel_safaricom_telkom_3g",
+                         "Airtel_Safaricom_Telkom_3G_2022test",
+                         "3G_coverage_WFL1"]),
+    ("4g", "all",       ["Airtel_Safaricom_Telkom_4G_Covered"]),
+    ("4g", "Safaricom", ["safaricom_4G_2022"]),
+    ("4g", "Airtel",    ["airtel_4G"]),
+    ("4g", "Telkom",    ["Telkom_4G"]),
+]
+
+# Field names vary between layers (they were published by different people at
+# different times), so we resolve them by trying candidates in order.
+# THERE IS NO CODE FIELD. "slcode" LOOKS LIKE ONE AND IS NOT.
+# The first probe reported hundreds of "split rows" because slcode repeated.
+# It repeats because slcode holds a NAME, identical to sublocatio -- ABAKAILE,
+# IFTIN, TOWNSHIP. Nearly every Kenyan town has a sublocation called TOWNSHIP,
+# so the collisions were different places sharing a name, not one place split
+# in two. Checked against the real key (county + constituency + ward + name)
+# every layer is exactly unique: 7,134 of 7,134 and 9,274 of 9,274.
+#
+# So admin_code is written NULL. Inventing a code here, or trusting slcode as
+# one, would give every TOWNSHIP in Kenya the same identifier and let a later
+# join fan out silently across counties.
+FIELD_CANDIDATES = {
+    "sublocation": ["sublocatio", "sublocation", "SUBLOCATIO"],
+    "location":    ["location", "LOCATION"],
+    "county":      ["county", "COUNTY"],
+    "constituency": ["constituen", "constituency", "CONSTITUEN"],
+    "ward_name":   ["ward", "WARD"],
+    "ward_code":   ["wardcode", "WARDCODE"],
+    "population":  ["Population", "POPULATION", "Populati_1"],
+    "area_sqkm":   ["area_sqkm", "AREA_SQKM", "Area_sqkm"],
+    "cov_area":    ["Coverage_Area_sqkm", "coverage_area_sqkm"],
+    "cov_pct":     ["percentagecoverage", "PercentageCoverage", "pct_cov"],
+}
+# The composite that IS unique. Used for the duplicate check.
+KEY_PARTS = ["county", "constituency", "ward_name", "sublocation"]
+
+# COUNTY NAME MATCHING. Run 65 is a lesson in why guessing is worse than
+# nothing: run 64 had 1.7% unmatched (THARAKA alone), I wrote an alias table
+# from memory including NAIROBI -> NAIROBI CITY and hyphenated spellings, and
+# the miss rate went to 65.7%. Every one of those aliases was a guess about
+# what admin.counties contains, and Nairobi is a large county, so guessing
+# wrong there broke thousands of rows at once.
+#
+# The fix is DETERMINISTIC NORMALISATION, not aliases and not fuzzy matching.
+# Both sides get uppercased, apostrophes removed, hyphens and underscores
+# turned into spaces, and runs of whitespace collapsed. That makes
+# TAITA-TAVETA == "TAITA TAVETA" and MURANG'A == MURANGA by rule rather than
+# by my recollection, and it cannot pair two genuinely different counties.
+def norm_county(s):
+    if s is None:
+        return ""
+    s = str(s).upper().replace("'", "").replace("`", "")
+    for ch in "-_/.":
+        s = s.replace(ch, " ")
+    return " ".join(s.split())
+
+
+# Only for genuinely DIFFERENT names, where no normalisation can help. Keys
+# and values are both normalised. THARAKA is evidence from run 64, the one
+# name that stayed unmatched before I started guessing.
+COUNTY_ALIASES = {
+    "THARAKA": "THARAKA NITHI",
+}
+
+
+def fetch_json(url, timeout=TIMEOUT, retries=8):
+    """Run 64 died on 'getaddrinfo failed' 6,000 rows into the fourth layer:
+    the connection dropped for longer than four short retries covered. DNS
+    failures on a home link routinely last a minute or two, so the backoff
+    now runs to about five minutes total before giving up."""
+    last = None
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "LIP-ETL/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        # http.client.IncompleteRead and RemoteDisconnected are
+        # HTTPExceptions, NOT OSErrors, so run 66 sailed straight past the
+        # retry loop and crashed on a half-delivered 24 MB page. Catching
+        # HTTPException is the difference between a retry and a dead run.
+        except (urllib.error.URLError, TimeoutError, OSError,
+                http.client.HTTPException, json.JSONDecodeError) as e:
+            last = e
+            if attempt == retries:
+                raise
+            wait = min(60, 4 * attempt)
+            print(f"        network hiccup ({type(e).__name__}), retry "
+                  f"{attempt}/{retries - 1} in {wait}s", flush=True)
+            time.sleep(wait)
+    raise last if last else RuntimeError("unreachable")
+
+
+def q(service, params):
+    return (f"{CA_ROOT}/{service}/FeatureServer/0/query?"
+            + urllib.parse.urlencode(params))
+
+
+def resolve(fields, key):
+    """Pick the first candidate field name this layer actually has."""
+    have = {f["name"] for f in fields}
+    for c in FIELD_CANDIDATES[key]:
+        if c in have:
+            return c
+    return None
+
+
+def probe(service):
+    meta = fetch_json(f"{CA_ROOT}/{service}/FeatureServer/0?f=json")
+    if "error" in meta:
+        return {"service": service, "error": meta["error"].get("message")}
+    cnt = fetch_json(q(service, {"where": "1=1", "returnCountOnly": "true",
+                                 "f": "json"}))
+    edit = meta.get("editingInfo", {}).get("dataLastEditDate")
+    fields = meta.get("fields", [])
+    resolved = {k: resolve(fields, k) for k in FIELD_CANDIDATES}
+
+    # IS ONE ROW ONE SUBLOCATION? The first probe returned 7,134 / 9,274 /
+    # 10,371 / 10,639 / 12,871 features for layers that should all describe
+    # the same ~7,134 Kenyan sublocations. They cannot all be one-row-per-unit,
+    # so we ask rather than assume: if the admin code repeats, the layer has
+    # been split into parts and a percentage may be per-part rather than per
+    # sublocation. Loading that as if it were per-unit would let a query
+    # average two halves of one sublocation and call it a national figure.
+    key_fields = [resolved[k] for k in KEY_PARTS if resolved.get(k)]
+    distinct = None
+    if key_fields:
+        d = fetch_json(q(service, {
+            "where": "1=1", "outFields": ",".join(key_fields),
+            "returnDistinctValues": "true", "returnCountOnly": "true",
+            "returnGeometry": "false", "f": "json"}))
+        if d and "count" in d:
+            distinct = d["count"]
+
+    return {
+        "service": service,
+        "count": cnt.get("count") if cnt else None,
+        "distinct_codes": distinct,
+        "geometry": meta.get("geometryType"),
+        "wkid": meta.get("spatialReference", {}).get("latestWkid"),
+        "max_rec": meta.get("maxRecordCount", PAGE),
+        "edited": (time.strftime("%Y-%m-%d", time.gmtime(edit / 1000))
+                   if edit else "unknown"),
+        "fields": fields,
+        "resolved": resolved,
+    }
+
+
+def fetch_layer(service, info, cache_dir=None):
+    """Paginated GeoJSON pull, server-side reprojected to EPSG:4326.
+
+    EVERY PAGE IS CACHED TO DISK. This is session 5's lesson applied to a
+    flaky link rather than a slow one: separate FETCH from everything that
+    follows, so a connection drop costs one page instead of a whole layer.
+    Runs 64 and 66 both died mid-layer and threw away thousands of rows that
+    had already arrived intact. Delete the cache directory to force a
+    genuine refetch.
+    """
+    out, offset = [], 0
+    page = min(PAGE, info.get("max_rec") or PAGE)
+    cached = 0
+    while True:
+        blob = None
+        cf = (cache_dir / f"{service}_{offset:06d}.json") if cache_dir else None
+        if cf and cf.exists() and cf.stat().st_size > 2:
+            try:
+                blob = json.loads(cf.read_text(encoding="utf-8"))
+                cached += 1
+            except json.JSONDecodeError:
+                blob = None            # truncated cache file: refetch it
+        if blob is None:
+            blob = fetch_json(q(service, {
+                "where": "1=1", "outFields": "*", "returnGeometry": "true",
+                "outSR": "4326", "f": "geojson",
+                "resultOffset": offset, "resultRecordCount": page,
+            }))
+            if cf:
+                # Write to a .part then rename, so an interrupted write can
+                # never leave a half-file that a later run trusts.
+                part = cf.with_suffix(".part")
+                part.write_text(json.dumps(blob), encoding="utf-8")
+                part.replace(cf)
+        feats = blob.get("features", []) if blob else []
+        out.extend(feats)
+        if (offset // page) % 4 == 0 or len(feats) < page:
+            print(f"      {len(out):,} / {info['count']:,}"
+                  + (f"  ({cached} pages from cache)" if cached else ""),
+                  flush=True)
+        if len(feats) < page:
+            break
+        offset += page
+        if offset > 200_000:
+            raise SystemExit("Pagination runaway; aborting.")
+    return out
+
+
+def main():
+    probe_only = "--probe-only" in sys.argv
+
+    load_dotenv(BASE / ".env")
+    pw = os.getenv("DB_PASSWORD")
+    if not pw or pw == "put_your_password_here":
+        sys.exit("ERROR: edit the .env file and set DB_PASSWORD first.")
+    url = (f"postgresql+psycopg2://{os.getenv('DB_USER','postgres')}:{pw}"
+           f"@{os.getenv('DB_HOST','localhost')}:{os.getenv('DB_PORT','5432')}"
+           f"/{os.getenv('DB_NAME','land_intelligence_kenya')}")
+    engine = create_engine(url)
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    print("Connected to database:",
+          os.getenv("DB_NAME", "land_intelligence_kenya"))
+
+    # Fail early and clearly if v1.4 has not been applied.
+    with engine.connect() as conn:
+        cols = {r[0] for r in conn.execute(text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema='connectivity' AND table_name='coverage'
+        """))}
+    missing = {"coverage_pct", "admin_level", "admin_name",
+               "admin_code"} - cols
+    if missing and not probe_only:
+        sys.exit("ERROR: connectivity.coverage is missing " +
+                 ", ".join(sorted(missing)) +
+                 "\nApply 01_database/05_schema_update_v1.4.sql first.")
+
+    # -----------------------------------------------------------------------
+    # 1. PROBE EVERY LAYER FIRST. Print what is actually there.
+    # -----------------------------------------------------------------------
+    print("\n1. Probing the CA FeatureServer endpoints ...")
+    infos, usable = {}, []
+    for tech, operator, candidates in LAYER_CANDIDATES:
+        print(f"\n   [{tech} / {operator}]")
+        chosen = None
+        for service in candidates:
+            info = probe(service)
+            infos[service] = info
+            if info.get("error"):
+                print(f"     {service:40} ERROR: {info['error']}")
+                continue
+            r = info["resolved"]
+            n, d = info["count"], info["distinct_codes"]
+            dup = (n and d and n > d)
+            level = "sublocation" if r["sublocation"] else (
+                "location" if r["location"] else "unknown")
+            print(f"     {service:40} {n:>7,} feat  "
+                  f"EPSG:{info['wkid']}  edited {info['edited']}  "
+                  f"unit: {level}")
+            print(f"       distinct on county+constituency+ward+name: "
+                  + (f"{d:,}" if d is not None else "unknown")
+                  + (f"   <-- {n-d:,} TRUE DUPLICATES" if dup
+                     else "   (every row a distinct unit)"))
+            if not r["cov_pct"]:
+                print(f"       no coverage percentage field; trying next")
+                continue
+            if level == "unknown":
+                print(f"       no sublocation or location name; trying next")
+                continue
+            chosen = service
+            print(f"       USING THIS ONE")
+            break
+        if chosen:
+            usable.append((chosen, tech, operator))
+        else:
+            print(f"     no usable layer for {tech}/{operator}")
+
+    print(f"\n   {len(usable)} of {len(LAYER_CANDIDATES)} slots filled: "
+          + ", ".join(f"{t}/{o}" for _, t, o in usable))
+    if probe_only:
+        print("   --probe-only: stopping before any download or write.")
+        return
+    if not usable:
+        sys.exit("No usable layers. The CA may have republished; re-probe.")
+
+    with engine.begin() as conn:
+        run_id = conn.execute(text("""
+            INSERT INTO metadata.etl_runs (pipeline, started_at, run_status)
+            VALUES (:p, now(), 'running') RETURNING run_id
+        """), {"p": PIPELINE}).scalar()
+    print(f"ETL run opened (run_id={run_id})")
+
+    try:
+        # -------------------------------------------------------------------
+        # 2. Source registration. commercial_ok is FALSE on purpose.
+        # -------------------------------------------------------------------
+        with engine.begin() as conn:
+            source_id = conn.execute(text("""
+                SELECT source_id FROM metadata.sources
+                WHERE name = 'Communications Authority of Kenya'
+            """)).scalar()
+            if source_id is None:
+                # Column names read from land_intelligence_schema.sql, not
+                # from memory: the table has license (US spelling),
+                # redistribution_allowed, and a NOT NULL tier.
+                # tier 1 = Kenya government. The CA is the sector regulator.
+                source_id = conn.execute(text("""
+                    INSERT INTO metadata.sources
+                        (name, organisation, tier, url, license,
+                         redistribution_allowed, attribution_required,
+                         api_available, notes)
+                    VALUES
+                        ('Communications Authority of Kenya',
+                         'Communications Authority of Kenya', 1,
+                         'https://www.ca.go.ke/ict-services-coverage-geo-portal',
+                         'NOT DECLARED', FALSE, TRUE, TRUE,
+                         'ICT Services Coverage Geo-Portal (ArcGIS Hub). '
+                         'Items carry no licenseInfo and no '
+                         'accessInformation, so there is NO declared licence. '
+                         'Public download from a government portal is not a '
+                         'grant of commercial reuse: redistribution_allowed '
+                         'is FALSE until the CA confirms terms in writing. '
+                         'Data is SUBLOCATION coverage percentages, not '
+                         'point-level signal.')
+                    RETURNING source_id
+                """)).scalar()
+                print(f"   registered source_id={source_id} "
+                      f"(tier 1, license NOT DECLARED, "
+                      f"redistribution_allowed FALSE)")
+
+        # -------------------------------------------------------------------
+        # 3. Fetch and load, one layer at a time.
+        # -------------------------------------------------------------------
+        print("\n2. Fetching and loading ...")
+        # admin.counties column is 'name', not 'county_name'. Read from
+        # land_intelligence_schema.sql line 228 rather than assumed.
+        with engine.connect() as conn:
+            county_lookup = {r[0]: r[1] for r in conn.execute(text(
+                "SELECT name, county_code FROM admin.counties "
+                "WHERE status = 'active'"))}
+        print(f"   {len(county_lookup)} counties available for name matching")
+
+        # RESUME PER LAYER, DON'T WIPE AND RESTART.
+        # Run 64 loaded three layers, then lost DNS partway through the
+        # fourth. Deleting everything by source_id up front meant a rerun
+        # would re-download the 23,540 rows that had already arrived intact.
+        # So each layer is deleted and reloaded on its own, and a layer that
+        # is already complete is skipped unless --force is given.
+        #
+        # This is a resume marker, so lesson 11 applies: it must be a promise
+        # the code can honour. The check is source_layer AND row count against
+        # what the service reports right now, not a bare "some rows exist".
+        force = "--force" in sys.argv
+        with engine.connect() as conn:
+            present = {r[0]: r[1] for r in conn.execute(text("""
+                SELECT source_layer, count(*) FROM connectivity.coverage
+                WHERE source_id = :sid GROUP BY source_layer
+            """), {"sid": source_id})}
+
+        total = 0
+        for service, tech, operator in usable:
+            info = infos[service]
+            r = info["resolved"]
+            print(f"   {service}  ({tech}, {operator})")
+            have = present.get(service, 0)
+            expect = info["count"]
+            if have and not force:
+                # Only trust the marker if the count matches what the service
+                # reports. A short load is a failed load, not a resume point.
+                if abs(have - expect) <= 2:
+                    print(f"      already loaded ({have:,} rows), skipping. "
+                          f"Use --force to reload.")
+                    total += have
+                    continue
+                print(f"      partial from an earlier run ({have:,} of "
+                      f"{expect:,}); reloading this layer")
+            level = ("sublocation" if info["resolved"]["sublocation"]
+                     else "location")
+            cache_dir = RAW_DIR / "pages"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            feats = fetch_layer(service, info, cache_dir)
+
+            rows = []
+            for f in feats:
+                g, p = f.get("geometry"), f.get("properties", {})
+                if g is None:
+                    continue
+                geom = shape(g)
+                if geom.is_empty:
+                    continue
+                if geom.geom_type == "Polygon":
+                    geom = MultiPolygon([geom])
+                elif geom.geom_type != "MultiPolygon":
+                    continue
+                pct = p.get(r["cov_pct"])
+                # REJECT, DO NOT CLIP. A percentage outside 0-100 means the
+                # source computed something we do not understand, and the
+                # CHECK constraint would reject it anyway. Lesson from pH.
+                if pct is not None and not (0 <= float(pct) <= 100):
+                    pct = None
+                def g(key):
+                    f = r.get(key)
+                    return p.get(f) if f else None
+                rows.append({
+                    "operator": operator, "technology": tech,
+                    "coverage_pct": pct,
+                    "admin_level": level,
+                    "admin_name": g("sublocation") or g("location"),
+                    # NULL on purpose. See FIELD_CANDIDATES: slcode is a name,
+                    # not a code, and every TOWNSHIP in Kenya shares it.
+                    "admin_code": None,
+                    "ward_name": g("ward_name"),
+                    "ward_code_src": g("ward_code"),
+                    "population": g("population"),
+                    "area_sqkm": g("area_sqkm"),
+                    "covered_area_sqkm": g("cov_area"),
+                    "county_name_src": g("county"),
+                    "geometry": geom,
+                })
+            if not rows:
+                print(f"      nothing usable, skipped")
+                continue
+            # Run 64 loaded 7,132 rows from 7,134 features and said nothing
+            # about the two it dropped. Silent drops are how a layer quietly
+            # becomes incomplete, so they get counted and named.
+            if len(rows) != len(feats):
+                print(f"      dropped {len(feats)-len(rows):,} of "
+                      f"{len(feats):,} features (null or non-polygon geometry)")
+
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    DELETE FROM connectivity.coverage WHERE source_layer = :s
+                """), {"s": service})
+
+            gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")
+
+            # County NAME -> our county_code. The CA ships names in caps; we
+            # match case-insensitively and report the miss rate rather than
+            # letting unmatched counties become a silent NULL.
+            cmap = {norm_county(k): v for k, v in county_lookup.items()}
+            src = gdf["county_name_src"].map(norm_county)
+            src = src.replace(COUNTY_ALIASES)
+            gdf["county_code"] = src.map(cmap)
+            unmatched = gdf["county_code"].isna().sum()
+            if unmatched:
+                names = sorted(set(
+                    gdf.loc[gdf["county_code"].isna(), "county_name_src"]
+                    .dropna().astype(str)))[:8]
+                print(f"      county name unmatched on {unmatched:,} rows "
+                      f"({100.0*unmatched/len(gdf):.1f}%): "
+                      f"{', '.join(names) if names else 'blank'}")
+                # Print OUR names too, so the mismatch is diagnosable from the
+                # output instead of needing a separate query. Guessing what
+                # admin.counties holds is what caused this.
+                print(f"      ours: {', '.join(sorted(county_lookup)[:8])} ...")
+            gdf = gdf.drop(columns=["county_name_src"])
+
+            gdf["source_id"] = source_id
+            gdf["source_layer"] = service
+            gdf["source_date"] = info["edited"] if info["edited"] != "unknown" else None
+            # CONFIDENCE FOLLOWS THE LAYER, NOT THE SOURCE. A regulator's
+            # production layer and a layer with "test" in its name do not
+            # deserve the same number just because the same body published
+            # both. Anything marked test, or older than 2023, drops to 2.
+            low = ("test" in service.lower()
+                   or (info["edited"] != "unknown" and info["edited"] < "2023"))
+            gdf["confidence"] = 2 if low else 3
+            if low:
+                print(f"      confidence 2: layer name or vintage "
+                      f"({info['edited']}) is weaker than the rest")
+            gdf.rename(columns={"geometry": "geom"}).set_geometry("geom").to_postgis(
+                "coverage", engine, schema="connectivity",
+                if_exists="append", index=False)
+            total += len(gdf)
+            pcts = gdf["coverage_pct"].dropna()
+            print(f"      loaded {len(gdf):,} rows; coverage_pct median "
+                  f"{pcts.median():.1f}%, at 100%: "
+                  f"{100.0*(pcts >= 99.999).mean():.1f}% of rows")
+            n, d = info["count"], info["distinct_codes"]
+            if n and d and n > d:
+                # Say it at load time as well as probe time, because this is
+                # the number that will mislead a later query: averaging
+                # coverage_pct over rows weights split sublocations twice.
+                print(f"      NOTE: {n:,} rows for {d:,} sublocations. "
+                      f"Aggregate by admin_code, never by row.")
+
+        # -------------------------------------------------------------------
+        # 3b. ARE TWO TECHNOLOGIES SECRETLY THE SAME DATA?
+        # Run 64 reported 3g and 4g with identical summary statistics: same
+        # 7,134 features, same 99.5% median, same 12.0% at exactly 100%. That
+        # is either a coincidence or the CA published one dataset twice, and
+        # storing 4G figures under a 3G label would be a silent lie to every
+        # buyer in a marginal area. Coincidence is cheap to rule out: join the
+        # two on their unique key and see how often the percentage agrees to
+        # six decimal places.
+        # -------------------------------------------------------------------
+        print("\n3. Checking whether any two technologies are the same data")
+        with engine.connect() as conn:
+            pairs = conn.execute(text("""
+                SELECT a.technology, b.technology,
+                       count(*) AS n,
+                       count(*) FILTER (
+                           WHERE round(a.coverage_pct::numeric, 6)
+                               = round(b.coverage_pct::numeric, 6)) AS same
+                FROM connectivity.coverage a
+                JOIN connectivity.coverage b
+                  ON a.admin_name  IS NOT DISTINCT FROM b.admin_name
+                 AND a.ward_name   IS NOT DISTINCT FROM b.ward_name
+                 AND a.county_code IS NOT DISTINCT FROM b.county_code
+                 AND a.technology  < b.technology
+                WHERE a.source_id = :sid AND b.source_id = :sid
+                  AND a.operator = 'all' AND b.operator = 'all'
+                  AND a.coverage_pct IS NOT NULL
+                  AND b.coverage_pct IS NOT NULL
+                GROUP BY 1, 2
+            """), {"sid": source_id}).fetchall()
+        suspect = []
+        for t1, t2, n, same in pairs:
+            pct = 100.0 * same / n if n else 0.0
+            flag = "  <-- LOOKS LIKE THE SAME DATASET" if pct > 95 else ""
+            print(f"   {t1} vs {t2}: {same:,}/{n:,} rows identical "
+                  f"({pct:.1f}%){flag}")
+            if pct > 95:
+                suspect.append((t1, t2, pct))
+        # DETECTING IT IS NOT ENOUGH. A warning printed at 3am into a log
+        # nobody reads still leaves 4G figures sitting in the table under a
+        # 3G label, and the enrichment engine will serve them. So the weaker
+        # layer is DELETED here, and the reason is printed loudly.
+        for t1, t2, pct in suspect:
+            with engine.connect() as conn:
+                cand = conn.execute(text("""
+                    SELECT DISTINCT technology, source_layer, source_date
+                    FROM connectivity.coverage
+                    WHERE source_id = :sid AND operator = 'all'
+                      AND technology IN (:t1, :t2)
+                """), {"sid": source_id, "t1": t1, "t2": t2}).fetchall()
+            # Weaker = 'test' in the name, else the older vintage.
+            def weakness(row):
+                tech, layer, sdate = row
+                return (0 if "test" in (layer or "").lower() else 1,
+                        str(sdate or ""))
+            cand = sorted(cand, key=weakness)
+            drop_tech, drop_layer, drop_date = cand[0]
+            keep_tech, keep_layer, keep_date = cand[-1]
+            with engine.begin() as conn:
+                n = conn.execute(text("""
+                    DELETE FROM connectivity.coverage
+                    WHERE source_id = :sid AND source_layer = :lyr
+                """), {"sid": source_id, "lyr": drop_layer}).rowcount
+            print(f"\n   REMOVED {n:,} '{drop_tech}' rows from {drop_layer} "
+                  f"({drop_date}).")
+            print(f"   They were {pct:.1f}% identical to '{keep_tech}' from "
+                  f"{keep_layer} ({keep_date}), which is kept.")
+            print(f"   The CA published one dataset under two technology")
+            print(f"   names. Serving it as '{drop_tech}' would tell a buyer")
+            print(f"   in a marginal area they have a network the data never")
+            print(f"   measured. connectivity.coverage now has NO {drop_tech}.")
+            print(f"   CAVEAT ON WHAT REMAINS: if the duplication means the")
+            print(f"   kept layer is the mislabelled one, '{keep_tech}' may")
+            print(f"   actually describe {drop_tech}. We cannot tell from the")
+            print(f"   data alone. Ask the CA which is which.")
+        if not suspect:
+            print("   No pair looks duplicated. Technologies differ as they"
+                  " should.")
+
+        # -------------------------------------------------------------------
+        # 3c. BACKFILL county_code FROM GEOMETRY.
+        # 63.5% of the per-operator rows carry a BLANK county attribute in the
+        # source. That is not a matching failure and no alias table can fix
+        # it: the CA simply did not populate the field. But we hold the
+        # polygon, so the county can be recovered from where it actually is,
+        # which is better evidence than a name string anyway.
+        # Largest-overlap, not centroid: a sublocation straddling a county
+        # line should be attributed to the county holding most of it, and a
+        # centroid can fall outside a concave polygon entirely.
+        # -------------------------------------------------------------------
+        print("\n4. Backfilling county_code from geometry where it is NULL")
+        with engine.connect() as conn:
+            bad_geom = conn.execute(text("""
+                SELECT count(*) FROM connectivity.coverage
+                WHERE source_id = :s AND NOT ST_IsValid(geom)
+            """), {"s": source_id}).scalar()
+        if bad_geom:
+            print(f"   {bad_geom:,} rows have invalid geometry as published; "
+                  f"repaired at query time, stored geometry left untouched")
+        with engine.begin() as conn:
+            filled = conn.execute(text("""
+                WITH best AS (
+                    -- ST_MakeValid on both sides. The raw CA polygons contain
+                    -- at least one self-intersecting ring (GEOS: "Ring edge
+                    -- missing at 35.437,-0.895"), and ST_Intersection throws
+                    -- on invalid input rather than returning a wrong answer.
+                    -- Repairing at query time keeps the stored geometry
+                    -- exactly as published, which matters for provenance.
+                    SELECT c.id,
+                           (SELECT k.county_code
+                            FROM admin.counties k
+                            WHERE k.status = 'active'
+                              AND ST_Intersects(k.geom, ST_MakeValid(c.geom))
+                            ORDER BY ST_Area(ST_Intersection(
+                                         ST_MakeValid(k.geom),
+                                         ST_MakeValid(c.geom))) DESC
+                            LIMIT 1) AS code
+                    FROM connectivity.coverage c
+                    WHERE c.source_id = :sid AND c.county_code IS NULL
+                )
+                UPDATE connectivity.coverage t
+                SET county_code = best.code
+                FROM best
+                WHERE t.id = best.id AND best.code IS NOT NULL
+            """), {"sid": source_id}).rowcount
+            still = conn.execute(text("""
+                SELECT count(*) FROM connectivity.coverage
+                WHERE source_id = :sid AND county_code IS NULL
+            """), {"sid": source_id}).scalar()
+        print(f"   filled {filled:,} rows by largest overlap; "
+              f"{still:,} still NULL (outside every county polygon)")
+
+        # -------------------------------------------------------------------
+        # 5. Close out.
+        # -------------------------------------------------------------------
+        # Count what is actually in the table, not what we downloaded. Run 67
+        # reported 44,254 rows AFTER deleting 7,132 duplicates, because the
+        # counter was incremented at load time and never revisited. A logged
+        # rows_out that disagrees with the table is exactly the kind of small
+        # untruth that makes an audit trail useless later.
+        with engine.connect() as conn:
+            total = conn.execute(text("""
+                SELECT count(*) FROM connectivity.coverage WHERE source_id=:s
+            """), {"s": source_id}).scalar()
+
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE metadata.datasets
+                SET etl_status = 'ingested', updated_at = now()
+                WHERE code = 'connectivity.coverage'
+            """))
+            conn.execute(text("""
+                UPDATE metadata.etl_runs
+                SET finished_at = now(), run_status = 'success', rows_out = :n
+                WHERE run_id = :id
+            """), {"n": total, "id": run_id})
+
+        print(f"\nDONE. Run {run_id} logged as success. "
+              f"{total:,} rows in connectivity.coverage.")
+        print("\nTHREE THINGS THAT MUST REACH THE PRODUCT:")
+        print(" 1. These are SUBLOCATION percentages, not point-level")
+        print("    coverage. Never tell a buyer 'this parcel has 4G'.")
+        print("    Pair with distance-to-tower, which IS point-specific.")
+        print(" 2. AIRTEL 4G IS NOT PUBLISHED with a coverage percentage, so")
+        print("    per-operator 4G holds Safaricom and Telkom only. ABSENCE")
+        print("    OF AIRTEL IS ABSENCE OF DATA, NOT ABSENCE OF COVERAGE.")
+        print("    Any per-operator display must say so explicitly.")
+        print(" 3. Licence NOT DECLARED. Get written CA confirmation before")
+        print("    commercial launch. Check source_layer per row: vintages")
+        print("    run from Jan 2022 to Aug 2023 and are not comparable.")
+        with engine.connect() as conn:
+            final = conn.execute(text("""
+                SELECT technology, operator, count(*), min(confidence),
+                       min(source_date), max(source_date)
+                FROM connectivity.coverage WHERE source_id = :sid
+                GROUP BY 1, 2 ORDER BY 1, 2
+            """), {"sid": source_id}).fetchall()
+        print(f"\n   {'tech':6}{'operator':12}{'rows':>9}{'conf':>6}"
+              f"   vintage")
+        for t, o, n, c, d0, d1 in final:
+            span = str(d0) if d0 == d1 else f"{d0} to {d1}"
+            print(f"   {t:6}{o:12}{n:>9,}{c:>6}   {span}")
+
+    # BaseException, NOT Exception, and this is load-bearing.
+    # This script's own guards raise SystemExit, and Ctrl+C raises
+    # KeyboardInterrupt. Both inherit from BaseException, so an
+    # `except Exception` handler never fires for them and the
+    # metadata.etl_runs row is left at 'running' forever. That bug left 12
+    # orphan rows across a month of work, including runs PROGRESS.md
+    # documents as failures. The trailing `raise` is unchanged: this logs
+    # the failure and then gets out of the way.
+    except BaseException as exc:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE metadata.etl_runs
+                SET finished_at=now(), run_status='failed', error_message=:e
+                WHERE run_id=:id
+            """), {"e": str(exc)[:2000], "id": run_id})
+        raise
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,28 @@
+# =========================================================================
+# GEOCODE LANDIQ - the public face
+#
+# ONE service, on purpose. The database is NOT in this file.
+#
+# WHY NOT: a compose file that also runs Postgres invites `docker compose
+# down -v` to delete the country. The database is the asset - 30 ETL runs,
+# every parcel a client has uploaded - and it belongs on managed Postgres
+# with backups somebody else is responsible for, or on a volume that no
+# compose command can drop by accident.
+#
+# Point DB_HOST at that database. This file only runs the widget.
+# =========================================================================
+services:
+  api:
+    build: .
+    image: geocode/landiq-embed:0.1.0
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # 127.0.0.1 ONLY. The reverse proxy terminates TLS and forwards here.
+      # Binding 0.0.0.0 would put the API on the public internet on port
+      # 8000 in plain HTTP, alongside the proxy, and the API key travels in
+      # a header - so that is a key on the wire in clear text.
+      - "127.0.0.1:8000:8000"
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }

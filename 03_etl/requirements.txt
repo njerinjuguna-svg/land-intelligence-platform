@@ -1,0 +1,6 @@
+geopandas>=1.0
+pandas>=2.0
+SQLAlchemy>=2.0
+GeoAlchemy2>=0.15
+psycopg2-binary>=2.9
+python-dotenv>=1.0

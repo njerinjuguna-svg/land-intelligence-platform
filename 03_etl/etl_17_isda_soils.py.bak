@@ -1,0 +1,648 @@
+"""
+============================================================================
+ETL 17 - iSDAsoil: SOIL pH + TEXTURE (soils.ph, soils.texture) at 30 m
+Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+What this script does:
+  Pulls two soil layers for Kenya from iSDAsoil and catalogues them:
+    - soils.ph      : soil pH (H2O), 0-20 cm depth
+    - soils.texture : USDA texture class, 0-20 cm (1=Clay ... 12=Sand)
+  Both are 30 m, CC-BY-4.0 (commercial use OK with attribution).
+  Source: iSDA Africa (Hengl et al. 2021).
+
+--------------------------------------------------------------------------
+VERSION 2 - THE FETCH-THEN-REPROJECT REWRITE (session 5)
+--------------------------------------------------------------------------
+Version 1 tried to do everything in one move: open the Africa-wide file over
+the internet, reproject it to lon/lat on the fly, and read Kenya's window out
+of the reprojected view. That worked in theory and was miserable in practice
+(hours, constant truncated-tile errors, sometimes a dead stall).
+
+WHY it was slow, in plain language:
+  The file on the server is stored in Web Mercator. We were asking for it in
+  lon/lat. Those two grids do not line up, so to hand us one tidy row of
+  lon/lat pixels GDAL had to go and collect scraps of source pixels from many
+  places at once. Every read turned into thousands of small, scattered
+  requests. On a strong connection you barely notice. On a weak one, each
+  scattered request is another chance to fail, and the failures compound.
+  Note that plain sequential downloading on this same connection is fine
+  (etl_13 pulled 96 DEM tiles without complaint). So the bytes were never the
+  problem. The reprojection was.
+
+THE FIX - do one thing at a time:
+  STAGE A - FETCH. Read Kenya's window in the file's OWN grid (EPSG:3857),
+            with no reprojection at all. Because we are not bending the grid,
+            the pixels we want sit next to each other in the file, so this
+            behaves like a plain sequential download: fast and reliable.
+            Save it to a local file.
+  STAGE B - REPROJECT. Reproject that small LOCAL file to EPSG:4326 and apply
+            the value transform in the same pass. No network involved, so it
+            cannot drop a tile. This is just CPU and disk.
+  STAGE C - Encode, convert to COG, catalogue in the database.
+
+  Both stages are resumable: each keeps a tiny progress marker file recording
+  how many rows are finished, so a dropped connection or a closed laptop costs
+  you the last strip, not the whole run.
+
+  This same fetch-then-reproject pattern should be used for EVERY future
+  remote COG source. It is the general lesson, not an iSDA quirk.
+
+Why we cannot just download the whole file:
+  The iSDA Africa mosaic is 328,563 x 289,306 pixels. A windowed read in the
+  native grid is the right unit of work.
+
+Why soil matters for the product:
+  pH tells a farmer or buyer whether the land is acidic or alkaline (crop
+  suitability, lime cost). Texture (especially heavy CLAY, i.e. "black cotton"
+  soil) is a major BUILDING signal: expansive clay cracks foundations and
+  roads. These feed both the "can I farm here" and "can I build here"
+  questions.
+
+pH back-transformation (VERIFIED, do not change without evidence):
+  iSDA transforms most properties, but for pH the file simply stores pH x 10.
+  Raw values run 43..254, mean 70.4, i.e. mean pH 7.04, correct for Kenya.
+  An earlier assumption of exp(x/10)-1 gave a mean of 7.6 million, which is
+  how we caught it. We also STORE pH x 10, as Int16 carrying a 0.1 scale tag,
+  so the numbers pass straight through unchanged.
+
+Impossible values are REJECTED, not squashed:
+  A handful of edge pixels sit just under the 255 nodata marker and would
+  back-transform to nonsense such as pH 25.4. We mark those nodata. Clipping
+  them to 10.0 would turn nonsense into a plausible-looking wrong number, and
+  a buyer can live with a gap but not with a confident wrong answer.
+
+How to run (from 03_etl with venv active):
+  python etl_17_isda_soils.py            # both layers
+  python etl_17_isda_soils.py ph         # just pH
+  python etl_17_isda_soils.py texture    # just texture
+  python etl_17_isda_soils.py ph refetch # force a fresh download of stage A
+============================================================================
+"""
+
+import os
+import sys
+import time
+import hashlib
+from pathlib import Path
+
+# --- Fix PROJ/GDAL database clash with the system PostgreSQL/PostGIS ---------
+# PostgreSQL sets PROJ_LIB / GDAL_DATA (system-wide) to its own OLDER copies,
+# which breaks rasterio's newer PROJ (error: proj.db LAYOUT.VERSION too old).
+# Drop those inherited vars BEFORE importing rasterio so it uses its own bundled
+# up-to-date databases. Only affects this process; does not touch PostgreSQL.
+for _k in ("PROJ_LIB", "PROJ_DATA", "GDAL_DATA"):
+    os.environ.pop(_k, None)
+
+import numpy as np
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+try:
+    import rasterio
+    from rasterio.windows import Window, from_bounds
+    from rasterio.vrt import WarpedVRT
+    from rasterio.enums import Resampling
+    from rasterio.warp import transform_bounds
+    from rasterio.shutil import copy as rio_copy
+except ImportError:
+    sys.exit("ERROR: rasterio missing. With venv active: pip install rasterio")
+
+BASE = Path(__file__).resolve().parent
+PROJECT = BASE.parent
+PIPELINE = "etl_17_isda_soils"
+
+COG_DIR = PROJECT / "06_rasters" / "cog" / "soils"
+COG_DIR.mkdir(parents=True, exist_ok=True)
+TMP_DIR = BASE / "data" / "raw" / "soils"
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+M_PER_DEG = 111320.0
+
+# Strip heights. Stage A is snapped to whole source tile rows at runtime so a
+# strip is one contiguous run of bytes on the server. Stage B is local, so the
+# only thing that matters there is memory.
+FETCH_ROWS_TARGET = 1024
+WARP_ROWS = 512
+
+# Pad Kenya's bounding box outward before fetching, so reprojection has real
+# pixels to work with at the very edge instead of running off the end.
+PAD_DEG = 0.05
+
+BUCKET = "/vsicurl/https://isdasoil.s3.amazonaws.com/soil_data"
+
+ATTRIB = ("iSDAsoil (c) iSDA Africa, CC-BY-4.0; Hengl et al. 2021, "
+          "Sci Rep 11:6130.")
+
+# The two layers we ingest. band 1 = the 0-20 cm layer in each file.
+LAYERS = [
+    {
+        "code": "soils.ph", "variable": "ph",
+        "url": f"{BUCKET}/ph/ph.tif", "band": 1,
+        "transform": "ph_x10",              # pH = stored / 10
+        "encode": "int16x10",               # store pH * 10 (0.1 precision)
+        "resampling": "bilinear",           # continuous field -> smooth
+        "native_name": "native_ph_3857.tif",
+        "out_name": "soils_ph_isda_30m.tif",
+        "cat_name": ("Soil pH (H2O) 0-20 cm, Int16 scale 0.1 = pH, from iSDAsoil "
+                     "(stored as pH x 10). " + ATTRIB),
+        "confidence": 3,
+        # iSDA marks empty pixels with 255 but does not always declare it in the
+        # file header. We must state it explicitly, otherwise a bilinear warp
+        # will average 255 into real soil pixels along coastlines and lake
+        # edges and invent pH values that never existed.
+        "assume_nodata": 255,
+    },
+    {
+        "code": "soils.texture", "variable": "texture_class",
+        "url": f"{BUCKET}/texture_class/texture_class.tif", "band": 1,
+        "transform": "none",                # categorical class codes
+        "encode": "byte",                   # 1..12, 0 = nodata
+        "resampling": "nearest",            # categorical -> never blend classes
+        "native_name": "native_texture_3857.tif",
+        "out_name": "soils_texture_class_isda_30m.tif",
+        "cat_name": ("USDA texture class 0-20 cm (1=Clay,2=Silty Clay,3=Sandy "
+                     "Clay,4=Clay Loam,5=Silty Clay Loam,6=Sandy Clay Loam,"
+                     "7=Loam,8=Silt Loam,9=Sandy Loam,10=Silt,11=Loamy Sand,"
+                     "12=Sand), from iSDAsoil. " + ATTRIB),
+        "confidence": 3,
+        "assume_nodata": 255,
+    },
+]
+
+OUT_NODATA_I16 = -32768
+
+# Plausible pH range for real soils. Anything outside becomes nodata.
+PH_VALID_MIN, PH_VALID_MAX = 3.0, 10.0
+
+
+def md5_of(path, chunk=8 * 1024 * 1024):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+# Bump these when the logic that FILLS a stage changes. A leftover working
+# file from an older tag is then refused instead of resumed.
+STAGE_A_TAG = "A2"
+STAGE_B_TAG = "B2"
+
+
+def write_progress(p, rows, w, h, tag):
+    """Record progress as rows plus a fingerprint of what produced them."""
+    p.write_text(f"{rows}|{w}|{h}|{tag}")
+
+
+def read_progress(p, w, h, tag, legacy_ok=False):
+    """How many rows a previous run finished, but ONLY if that run was writing
+    the SAME grid with the SAME code. Otherwise 0, meaning start again.
+
+    Why this is stricter than it looks: a bare row count is a promise that the
+    rows below it are good, and a half-finished file from a different version
+    of this script cannot honour that promise. Resuming onto it silently keeps
+    old pixels in a file we would then present as new. Redoing a local stage
+    costs minutes; shipping a raster we cannot account for costs trust."""
+    try:
+        parts = p.read_text().strip().split("|")
+    except OSError:
+        return 0
+    if len(parts) == 1:                       # marker from an older version
+        return int(parts[0]) if legacy_ok and parts[0].isdigit() else 0
+    if len(parts) < 4:
+        return 0
+    try:
+        rows, pw, ph = int(parts[0]), int(parts[1]), int(parts[2])
+    except ValueError:
+        return 0
+    if pw != w or ph != h or parts[3] != tag:
+        print(f"    ignoring a stale progress marker ({pw}x{ph} {parts[3]}, "
+              f"now {w}x{h} {tag}) and starting this stage fresh.")
+        return 0
+    return rows
+
+
+def eta_line(prefix, done, total, t_start, start_row=0):
+    """One progress line with speed and a time estimate.
+
+    start_row matters on a resumed run: the clock only started when THIS run
+    started, so speed must be measured over the rows this run actually did.
+    Dividing by all rows ever written flatters the rate and prints ETA 0."""
+    elapsed = time.time() - t_start
+    n = done - start_row
+    if n <= 0 or elapsed <= 0:
+        return
+    rate = n / elapsed
+    print(f"    {prefix} {done}/{total} rows ({100 * done / total:5.1f}%)  "
+          f"{rate * 60:.0f} rows/min  ETA {(total - done) / rate / 60:.0f} min",
+          flush=True)
+
+
+load_dotenv(BASE / ".env")
+pw = os.getenv("DB_PASSWORD")
+if not pw or pw == "put_your_password_here":
+    sys.exit("ERROR: edit the .env file and set DB_PASSWORD first.")
+
+url = (
+    f"postgresql+psycopg2://{os.getenv('DB_USER', 'postgres')}:{pw}"
+    f"@{os.getenv('DB_HOST', 'localhost')}:{os.getenv('DB_PORT', '5432')}"
+    f"/{os.getenv('DB_NAME', 'land_intelligence_kenya')}"
+)
+engine = create_engine(url)
+with engine.connect() as conn:
+    conn.execute(text("SELECT 1"))
+print("Connected to database:", os.getenv("DB_NAME", "land_intelligence_kenya"))
+
+with engine.begin() as conn:
+    run_id = conn.execute(text("""
+        INSERT INTO metadata.etl_runs (pipeline, started_at, run_status)
+        VALUES (:p, now(), 'running') RETURNING run_id
+    """), {"p": PIPELINE}).scalar()
+print(f"ETL run opened (run_id={run_id})")
+
+# GDAL settings for remote COG reading.
+#   MULTIRANGE=NO is deliberate and hard-won. YES with merged ranges made GDAL
+#   fetch huge contiguous byte ranges and effectively stall for hours. NO is
+#   the setting that actually completes.
+GDAL_ENV = dict(
+    GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
+    CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif",
+    GDAL_HTTP_MULTIRANGE="NO",
+    GDAL_HTTP_MAX_RETRY="10",
+    GDAL_HTTP_RETRY_DELAY="2",
+    GDAL_HTTP_TIMEOUT="120",
+    GDAL_CACHEMAX=1024,                     # MB of block cache (must be int)
+    CPL_VSIL_CURL_CACHE_SIZE=536870912,     # 512 MB remote-byte cache
+    VSI_CACHE="TRUE",
+    VSI_CACHE_SIZE=134217728,
+)
+
+
+# ===========================================================================
+# STAGE A - FETCH Kenya's window in the source's OWN grid, no reprojection
+# ===========================================================================
+def fetch_native(cfg, xmin, ymin, xmax, ymax, refetch=False):
+    """Download Kenya's window from the remote Africa COG WITHOUT warping it,
+    into a local EPSG:3857 GeoTIFF. Returns (path, nodata_value).
+
+    This is the whole point of version 2. We ask for pixels exactly as the
+    server stores them, so each strip is one contiguous run of bytes."""
+    native = TMP_DIR / cfg["native_name"]
+    progress_file = native.with_suffix(".progress")
+
+    if refetch:
+        native.unlink(missing_ok=True)
+        progress_file.unlink(missing_ok=True)
+
+    print(f"\n--- STAGE A: fetch native window  <-  {cfg['url']}")
+
+    with rasterio.open(cfg["url"]) as src:
+        nodata = src.nodata if src.nodata is not None else cfg.get("assume_nodata")
+        bh = src.block_shapes[0][0] or 512
+        print(f"    source: {src.count} bands, dtype {src.dtypes[0]}, "
+              f"declared nodata {src.nodata}, using nodata {nodata}, "
+              f"size {src.width} x {src.height}, block rows {bh}")
+
+        # WHICH GRID IS THIS FILE ACTUALLY IN?
+        # We cannot ask PROJ, because iSDA writes its CRS as a LOCAL_CS that
+        # PROJ refuses to interpret. But the geotransform is still readable,
+        # and it settles the question on its own: measure how wide the file is
+        # in its own units. Africa is about 80 degrees wide but about 9 MILLION
+        # metres wide, so the two cases are not remotely close and there is no
+        # guesswork. We check rather than assume, because getting this wrong
+        # would silently fetch the wrong patch of the planet.
+        span_x = abs(src.transform.a) * src.width
+        native_crs = "EPSG:4326" if span_x < 400 else "EPSG:3857"
+        print(f"    file spans {span_x:,.0f} units across -> treating the "
+              f"native grid as {native_crs}")
+
+        # Kenya's bbox, converted from lon/lat into the source's own grid.
+        # densify_pts follows the curve of the projection so we do not clip a
+        # corner.
+        x0, y0, x1, y1 = transform_bounds(
+            "EPSG:4326", native_crs,
+            xmin - PAD_DEG, ymin - PAD_DEG, xmax + PAD_DEG, ymax + PAD_DEG,
+            densify_pts=21)
+
+        win = from_bounds(x0, y0, x1, y1, src.transform)
+        win = win.round_offsets().round_lengths()
+        col_off = max(0, int(win.col_off))
+        row_off = max(0, int(win.row_off))
+        w = min(int(win.width), src.width - col_off)
+        h = min(int(win.height), src.height - row_off)
+        if w <= 0 or h <= 0:
+            raise SystemExit(f"Empty Kenya window for {cfg['code']} "
+                             f"(source {src.width}x{src.height}).")
+
+        transform = src.window_transform(Window(col_off, row_off, w, h))
+        px_m = (transform.a if native_crs == "EPSG:3857"
+                else transform.a * M_PER_DEG)
+        print(f"    Kenya window in native grid: {w} x {h} px "
+              f"(~{px_m:.1f} m per pixel), "
+              f"{w * h / 1e6:.0f} million pixels")
+
+        # Snap the strip height to whole source tile rows, so one strip maps to
+        # one unbroken band of tiles on the server. Then round up to a multiple
+        # of 512, which is our OUTPUT block height: writing whole blocks keeps
+        # the compressed local file valid when a resumed run reopens it.
+        strip = max(bh, (FETCH_ROWS_TARGET // bh) * bh)
+        if strip % 512:
+            strip = ((strip // 512) + 1) * 512
+
+        # legacy_ok=True: a bare row count written by the first version of this
+        # stage is still trustworthy, because the fetch geometry has not
+        # changed. This spares an already-downloaded window a 50 minute redo.
+        done_rows = (read_progress(progress_file, w, h, STAGE_A_TAG,
+                                   legacy_ok=True) if native.exists() else 0)
+        if done_rows >= h:
+            print(f"    already complete ({h} rows). Skipping download.")
+            return native, nodata
+        if done_rows:
+            print(f"    RESUMING at row {done_rows} of {h}.")
+
+        prof = {
+            "driver": "GTiff", "dtype": src.dtypes[0], "count": 1,
+            "crs": native_crs, "transform": transform,
+            "width": w, "height": h, "nodata": nodata,
+            "tiled": True, "blockxsize": 512, "blockysize": 512,
+            "compress": "DEFLATE", "bigtiff": "YES",
+        }
+        mode = "r+" if done_rows > 0 and native.exists() else "w"
+        with rasterio.open(native, mode, **({} if mode == "r+" else prof)) as dst:
+            t_start = time.time()
+            for r in range(done_rows, h, strip):
+                sh = min(strip, h - r)
+                sw = Window(col_off, row_off + r, w, sh)
+
+                # Retry with a FRESH connection. A dropped tile can leave the
+                # HTTP handle stale, so reusing it just fails again.
+                arr = None
+                for attempt in range(1, 13):
+                    try:
+                        if attempt == 1:
+                            arr = src.read(cfg["band"], window=sw)
+                        else:
+                            with rasterio.open(cfg["url"]) as s2:
+                                arr = s2.read(cfg["band"], window=sw)
+                        break
+                    except rasterio.errors.RasterioIOError:
+                        if attempt == 12:
+                            raise
+                        print(f"    ... read hiccup at rows {r}-{r + sh}, "
+                              f"retry {attempt} (fresh connection)", flush=True)
+                        time.sleep(min(3 * attempt, 20))
+
+                dst.write(arr, 1, window=Window(0, r, w, sh))
+                write_progress(progress_file, r + sh, w, h, STAGE_A_TAG)
+                eta_line("fetch", r + sh, h, t_start, done_rows)
+
+    size_mb = native.stat().st_size / 1_000_000
+    print(f"    native window saved: {native.name} ({size_mb:.0f} MB)")
+    return native, nodata
+
+
+# ===========================================================================
+# STAGE B - REPROJECT the LOCAL file to EPSG:4326 and transform the values
+# ===========================================================================
+def warp_and_encode(cfg, native, src_nodata, xmin, ymin, xmax, ymax):
+    """Reproject the local native-grid file to lon/lat, convert the values into
+    real units, encode them compactly, and write a working GeoTIFF.
+    Returns (tmp_path, out_dtype, out_nodata, scale, out_transform)."""
+    tmp = TMP_DIR / ("_" + cfg["out_name"])
+    progress_file = tmp.with_suffix(".progress")
+    print(f"\n--- STAGE B: reproject locally to EPSG:4326 + transform values")
+
+    resamp = (Resampling.bilinear if cfg.get("resampling") == "bilinear"
+              else Resampling.nearest)
+    if cfg["encode"] == "int16x10":
+        out_dtype, out_nodata, scale = "int16", OUT_NODATA_I16, 0.1
+    else:
+        out_dtype, out_nodata, scale = "uint8", 0, None
+
+    raw_min, raw_max, raw_sum, raw_n = np.inf, -np.inf, 0.0, 0
+
+    with rasterio.open(native) as src:
+        with WarpedVRT(src, crs="EPSG:4326", resampling=resamp,
+                       src_nodata=src_nodata, nodata=src_nodata) as vrt:
+            win = from_bounds(xmin, ymin, xmax, ymax, vrt.transform)
+            win = win.round_offsets().round_lengths()
+            col_off = max(0, int(win.col_off))
+            row_off = max(0, int(win.row_off))
+            w = min(int(win.width), vrt.width - col_off)
+            h = min(int(win.height), vrt.height - row_off)
+            if w <= 0 or h <= 0:
+                raise SystemExit(f"Empty warped window for {cfg['code']}.")
+
+            out_transform = vrt.window_transform(Window(col_off, row_off, w, h))
+            px_deg = vrt.transform.a
+            print(f"    output grid: {w} x {h} px "
+                  f"(~{px_deg * M_PER_DEG:.1f} m)")
+
+            # legacy_ok=False on purpose. Stage B is local and cheap to redo,
+            # so we never inherit rows we cannot account for.
+            done_rows = (read_progress(progress_file, w, h, STAGE_B_TAG)
+                         if tmp.exists() else 0)
+            if done_rows >= h:
+                print(f"    already complete ({h} rows). Skipping.")
+                return tmp, out_dtype, out_nodata, scale, out_transform, px_deg
+            if done_rows:
+                print(f"    RESUMING at row {done_rows} of {h}.")
+
+            prof = {
+                "driver": "GTiff", "dtype": out_dtype, "count": 1,
+                "crs": "EPSG:4326", "transform": out_transform,
+                "width": w, "height": h, "nodata": out_nodata,
+                "tiled": True, "blockxsize": 512, "blockysize": 512,
+                # Compress the working file too. Uncompressed Int16 over
+                # Kenya at 30 m is roughly 3 GB of scratch; this cuts it hard
+                # and costs very little time. Safe to resume because we only
+                # ever write forward, in whole 512-row blocks.
+                "compress": "DEFLATE", "predictor": 2,
+                "bigtiff": "YES",
+            }
+            mode = "r+" if done_rows > 0 and tmp.exists() else "w"
+            with rasterio.open(tmp, mode, **({} if mode == "r+" else prof)) as dst:
+                if scale is not None and mode == "w":
+                    dst.scales = (scale,)
+                t_start = time.time()
+                for r in range(done_rows, h, WARP_ROWS):
+                    sh = min(WARP_ROWS, h - r)
+                    arr = vrt.read(cfg["band"],
+                                   window=Window(col_off, row_off + r, w, sh))
+
+                    good = np.ones(arr.shape, dtype=bool)
+                    if src_nodata is not None:
+                        good &= (arr != src_nodata)
+
+                    if cfg["transform"] == "ph_x10":
+                        # Track the RAW numbers too. Printing raw alongside
+                        # transformed is what caught the wrong formula before.
+                        if good.any():
+                            rv = arr[good]
+                            raw_min = min(raw_min, float(rv.min()))
+                            raw_max = max(raw_max, float(rv.max()))
+                            raw_sum += float(rv.sum()); raw_n += rv.size
+                        val = arr.astype("float32")
+                        val /= 10.0                       # -> conventional pH
+                        # REJECT impossible pH, do not squash it into range.
+                        good &= (val >= PH_VALID_MIN) & (val <= PH_VALID_MAX)
+                        out = np.full(arr.shape, OUT_NODATA_I16, dtype="int16")
+                        out[good] = np.rint(val[good] * 10).astype("int16")
+                        del val
+                    else:                                  # categorical -> byte
+                        out = np.zeros(arr.shape, dtype="uint8")
+                        out[good] = arr[good].astype("uint8")
+
+                    dst.write(out, 1, window=Window(0, r, w, sh))
+                    write_progress(progress_file, r + sh, w, h, STAGE_B_TAG)
+                    eta_line("warp ", r + sh, h, t_start, done_rows)
+                    del arr, good, out
+
+    if raw_n:
+        cover = ("whole layer" if done_rows == 0
+                 else f"rows {done_rows}-{h} only, this run resumed")
+        print(f"    RAW source values: min {raw_min:.0f}  max {raw_max:.0f}  "
+              f"mean {raw_sum / raw_n:.1f}   (iSDA stores pH x 10; {cover})")
+    return tmp, out_dtype, out_nodata, scale, out_transform, px_deg
+
+
+# ===========================================================================
+# STAGE C - sanity check, COG, catalogue
+# ===========================================================================
+def finalise(cfg, tmp, out_dtype, out_nodata, scale, px_deg):
+    out_cog = COG_DIR / cfg["out_name"]
+
+    # Read the stats back from the FINISHED file rather than from the loop, so
+    # they are complete even when the run was resumed halfway.
+    print("\n--- STAGE C: checking values in the finished file ...")
+    s_min, s_max, s_sum, s_n = np.inf, -np.inf, 0.0, 0
+    with rasterio.open(tmp) as chk:
+        for _, win in chk.block_windows(1):
+            blk = chk.read(1, window=win)
+            good = blk != out_nodata
+            if good.any():
+                v = blk[good].astype("float64")
+                s_min = min(s_min, float(v.min()))
+                s_max = max(s_max, float(v.max()))
+                s_sum += float(v.sum()); s_n += v.size
+    if s_n:
+        f = 0.1 if scale == 0.1 else 1.0        # stored units -> real units
+        label = "pH" if cfg["variable"] == "ph" else "class"
+        print(f"    {label} values: min {s_min * f:.2f}  max {s_max * f:.2f}  "
+              f"mean {(s_sum / s_n) * f:.2f}")
+        if cfg["variable"] == "ph":
+            print("    EXPECT: min ~4.3, max <= 10.00, mean ~7.0. "
+                  "A max above 10 means the reject filter did not run.")
+        else:
+            print("    EXPECT: min 1, max 12, mean ~5.8.")
+
+    print("    converting to COG ...")
+    if out_cog.exists():
+        out_cog.unlink()
+    rio_copy(str(tmp), str(out_cog), driver="COG",
+             compress="DEFLATE", predictor=2,
+             overview_resampling="nearest", BIGTIFF="YES")
+    tmp.unlink(missing_ok=True)
+    tmp.with_suffix(".progress").unlink(missing_ok=True)
+    size_mb = out_cog.stat().st_size / 1_000_000
+    print(f"    COG: {out_cog.name}  ({size_mb:.0f} MB)")
+
+    with rasterio.open(out_cog) as s:
+        bounds = (s.bounds.left, s.bounds.bottom, s.bounds.right, s.bounds.top)
+    return out_cog, md5_of(out_cog), round(px_deg * M_PER_DEG, 1), bounds, out_nodata
+
+
+try:
+    with engine.connect() as conn:
+        xmin, xmax, ymin, ymax = conn.execute(text("""
+            SELECT ST_XMin(e), ST_XMax(e), ST_YMin(e), ST_YMax(e)
+            FROM (SELECT ST_Extent(geom) AS e FROM admin.country) t
+        """)).one()
+        source_id = conn.execute(text(
+            "SELECT source_id FROM metadata.sources WHERE name = 'iSDAsoil'"
+        )).scalar()
+    if source_id is None:
+        raise SystemExit("iSDAsoil source missing from metadata. Run etl_04 first.")
+    print(f"Kenya bbox: lon {xmin:.3f}..{xmax:.3f}, lat {ymin:.3f}..{ymax:.3f}")
+
+    args = [a.lower() for a in sys.argv[1:]]
+    refetch = "refetch" in args
+    wanted = [a for a in args if a != "refetch"]
+    todo = [c for c in LAYERS
+            if not wanted or any(w in c["variable"] or w in c["code"]
+                                 for w in wanted)]
+    if not todo:
+        raise SystemExit(f"No layer matched {wanted}. Use 'ph' and/or 'texture'.")
+    print("Layers this run: " + ", ".join(c["code"] for c in todo))
+    if refetch:
+        print("refetch requested: stage A will download again from scratch.")
+
+    for cfg in todo:
+        # Stage A talks to the network, so it runs inside the tuned GDAL env.
+        with rasterio.Env(**GDAL_ENV):
+            native, src_nodata = fetch_native(cfg, xmin, ymin, xmax, ymax,
+                                              refetch=refetch)
+        # Stages B and C are purely local. No HTTP settings needed.
+        tmp, out_dtype, out_nodata, scale, out_transform, px_deg = \
+            warp_and_encode(cfg, native, src_nodata, xmin, ymin, xmax, ymax)
+        cog, chk, px_m, bounds, ndv = finalise(cfg, tmp, out_dtype, out_nodata,
+                                               scale, px_deg)
+
+        with engine.connect() as conn:
+            dataset_id = conn.execute(text(
+                "SELECT dataset_id FROM metadata.datasets WHERE code = :c"
+            ), {"c": cfg["code"]}).scalar()
+        if dataset_id is None:
+            raise SystemExit(f"{cfg['code']} dataset missing. Run etl_04.")
+
+        with engine.begin() as conn:
+            conn.execute(text("""
+                DELETE FROM metadata.raster_catalog
+                WHERE dataset_id = :did AND variable = :v
+            """), {"did": dataset_id, "v": cfg["variable"]})
+            conn.execute(text("""
+                INSERT INTO metadata.raster_catalog
+                    (dataset_id, name, variable, storage_url, format,
+                     pixel_size_m, band_count, nodata_value, temporal_start,
+                     temporal_end, bbox, checksum, source_id, source_date,
+                     confidence)
+                VALUES
+                    (:did, :name, :v, :url, 'COG', :px, 1, :nodata,
+                     DATE '2001-01-01', DATE '2017-01-01',
+                     ST_MakeEnvelope(:l, :b, :r, :t, 4326),
+                     :chk, :sid, DATE '2021-01-01', :conf)
+            """), {
+                "did": dataset_id, "name": cfg["cat_name"], "v": cfg["variable"],
+                "url": str(cog), "px": px_m, "nodata": ndv,
+                "l": bounds[0], "b": bounds[1], "r": bounds[2], "t": bounds[3],
+                "chk": chk, "sid": source_id, "conf": cfg["confidence"],
+            })
+            conn.execute(text("""
+                UPDATE metadata.datasets SET etl_status = 'ingested',
+                       updated_at = now() WHERE code = :c
+            """), {"c": cfg["code"]})
+        print(f"    catalogued {cfg['code']}.")
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'success', rows_out = :r
+            WHERE run_id = :id
+        """), {"r": len(todo), "id": run_id})
+
+    print(f"\nDONE. Run {run_id} logged as success.")
+    print("The native download in 03_etl/data/raw/soils is kept on purpose: if "
+          "we ever change the encoding or the pH rule, stage B can rerun off "
+          "the local copy in minutes with no download at all.")
+    print("QGIS: add soils_ph (smooth, acidic in the highlands, alkaline in the "
+          "ASALs) and soils_texture_class (blocky classes; heavy clay = black "
+          "cotton risk).")
+
+except Exception as exc:
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'failed', error_message = :e
+            WHERE run_id = :id
+        """), {"e": str(exc)[:2000], "id": run_id})
+    raise

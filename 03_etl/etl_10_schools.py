@@ -1,0 +1,202 @@
+"""
+============================================================================
+ETL 10 - SCHOOLS (social.education)
+Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+Source: Ministry of Education school locations (via World Bank / KODI),
+point shapefile with GPS coordinates. Catalogue PRIMARY for education.
+
+What this script does:
+  1. Reads the Schools point shapefile from inside schools.zip
+  2. Detects the name and level columns (shapefile names are truncated,
+     so we detect rather than assume) and prints what it found
+  3. Maps level onto our vocabulary (primary/secondary/tvet/university/other)
+  4. Assigns county by spatial join, loads into social.education
+
+How to run (from 03_etl with venv active):
+  python etl_10_schools.py
+============================================================================
+"""
+
+import os
+import sys
+import zipfile
+import tempfile
+from datetime import date
+from pathlib import Path
+
+import geopandas as gpd
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+BASE = Path(__file__).resolve().parent
+RAW = BASE / "data" / "raw" / "schools"
+SOURCE_NAME = "Ministry of Education"    # matches sources.csv
+SOURCE_URL = "https://datacatalog.worldbank.org/search/dataset/0038039"
+SOURCE_DATE = date.today()
+PIPELINE = "etl_10_schools"
+
+
+def map_level(v):
+    s = str(v).lower()
+    if "prim" in s:
+        return "primary"
+    if "sec" in s:
+        return "secondary"
+    if "tvet" in s or "vocation" in s or "technical" in s or "polytechnic" in s:
+        return "tvet"
+    if "univ" in s or "college" in s:
+        return "university"
+    return "other"
+
+
+def map_ownership(v):
+    s = str(v).lower()
+    if "public" in s or "gov" in s or "harambee" in s:
+        return "public"
+    if "priv" in s:
+        return "private"
+    return None
+
+
+def read_schools_shp():
+    zips = sorted(RAW.glob("*.zip"))
+    if not zips:
+        raise RuntimeError("No schools zip under data/raw/schools/")
+    with zipfile.ZipFile(zips[0]) as zf:
+        shp = [n for n in zf.namelist() if n.lower().endswith(".shp")]
+        if not shp:
+            raise RuntimeError("No .shp inside the schools zip.")
+        tmp = tempfile.mkdtemp()
+        zf.extractall(tmp)
+        return gpd.read_file(Path(tmp) / shp[0])
+
+
+load_dotenv(BASE / ".env")
+pw = os.getenv("DB_PASSWORD")
+if not pw or pw == "put_your_password_here":
+    sys.exit("ERROR: edit the .env file and set DB_PASSWORD first.")
+
+url = (
+    f"postgresql+psycopg2://{os.getenv('DB_USER', 'postgres')}:{pw}"
+    f"@{os.getenv('DB_HOST', 'localhost')}:{os.getenv('DB_PORT', '5432')}"
+    f"/{os.getenv('DB_NAME', 'land_intelligence_kenya')}"
+)
+engine = create_engine(url)
+with engine.connect() as conn:
+    conn.execute(text("SELECT 1"))
+print("Connected to database:", os.getenv("DB_NAME", "land_intelligence_kenya"))
+
+with engine.begin() as conn:
+    conn.execute(text("CREATE SCHEMA IF NOT EXISTS staging"))
+    source_id = conn.execute(text("""
+        INSERT INTO metadata.sources
+            (name, organisation, tier, url, license,
+             redistribution_allowed, api_available, notes)
+        VALUES (:n, 'Government of Kenya', 1, :u, 'GoK open data',
+                true, false, 'School locations with GPS via World Bank/KODI.')
+        ON CONFLICT (name) DO UPDATE SET updated_at = now()
+        RETURNING source_id
+    """), {"n": SOURCE_NAME, "u": SOURCE_URL}).scalar()
+print(f"Source: {SOURCE_NAME} (source_id={source_id})")
+
+with engine.begin() as conn:
+    run_id = conn.execute(text("""
+        INSERT INTO metadata.etl_runs (pipeline, started_at, run_status)
+        VALUES (:p, now(), 'running') RETURNING run_id
+    """), {"p": PIPELINE}).scalar()
+print(f"ETL run opened (run_id={run_id})")
+
+try:
+    print("\nReading schools shapefile...")
+    gdf = read_schools_shp()
+    print(f"   {len(gdf):,} school points read")
+    print(f"   Columns present: {list(gdf.columns)}")
+
+    lower = {c.lower(): c for c in gdf.columns}
+
+    def find(*keys):
+        for k in keys:
+            for lc, orig in lower.items():
+                if k in lc:
+                    return orig
+        return None
+
+    name_col = find("name", "school", "instit")
+    level_col = find("level", "type", "categ", "class")
+    own_col = find("status", "owner", "sponsor", "public")
+    if name_col is None:
+        raise RuntimeError(
+            f"No name column detected. Columns: {list(gdf.columns)}")
+    print(f"   Using name={name_col!r}, level={level_col!r}, "
+          f"ownership={own_col!r}")
+
+    gdf["s_name"] = gdf[name_col].astype(str)
+    gdf["s_level"] = gdf[level_col].apply(map_level) if level_col else "other"
+    gdf["s_own"] = gdf[own_col].apply(map_ownership) if own_col else None
+
+    print("   Levels found:")
+    for t, c in gdf["s_level"].value_counts().items():
+        print(f"      {t}: {c:,}")
+
+    # Keep only rows with a real geometry, force EPSG:4326.
+    gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty].copy()
+    if gdf.crs is None:
+        gdf = gdf.set_crs(4326)
+    elif gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(4326)
+    gdf["gid"] = range(len(gdf))
+
+    print(f"   Staging {len(gdf):,} points...")
+    gdf[["gid", "s_name", "s_level", "s_own", "geometry"]].to_postgis(
+        "schools_raw", engine, schema="staging",
+        if_exists="replace", chunksize=10000)
+
+    print("   Assigning counties and loading social.education...")
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE INDEX ON staging.schools_raw USING gist (geometry)"))
+        conn.execute(text("ANALYZE staging.schools_raw"))
+        conn.execute(text(
+            "DELETE FROM social.education WHERE source_id = :sid"),
+            {"sid": source_id})
+        n = conn.execute(text("""
+            INSERT INTO social.education
+                (name, level, ownership, county_code, geom,
+                 source_id, source_date, confidence)
+            SELECT s.s_name, s.s_level, s.s_own, c.county_code,
+                   ST_Centroid(s.geometry), :sid, :sd, 3
+            FROM staging.schools_raw s
+            LEFT JOIN admin.counties c ON ST_Contains(c.geom, ST_Centroid(s.geometry))
+        """), {"sid": source_id, "sd": SOURCE_DATE}).rowcount
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'success', rows_out = :r
+            WHERE run_id = :id
+        """), {"r": n, "id": run_id})
+        conn.execute(text("""
+            UPDATE metadata.datasets SET etl_status = 'ingested', updated_at = now()
+            WHERE code = 'social.education'
+        """))
+    print(f"\nDONE. {n:,} schools loaded. Run {run_id} success.")
+    print("Verify: SELECT level, count(*) FROM social.education "
+          "GROUP BY 1 ORDER BY 2 DESC;")
+
+# BaseException, NOT Exception, and this is load-bearing.
+# This script's own guards raise SystemExit, and Ctrl+C raises
+# KeyboardInterrupt. Both inherit from BaseException, so an
+# `except Exception` handler never fires for them and the
+# metadata.etl_runs row is left at 'running' forever. That bug left 12
+# orphan rows across a month of work, including runs PROGRESS.md
+# documents as failures. The trailing `raise` is unchanged: this logs
+# the failure and then gets out of the way.
+except BaseException as exc:
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'failed', error_message = :e
+            WHERE run_id = :id
+        """), {"e": str(exc)[:2000], "id": run_id})
+    raise

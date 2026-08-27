@@ -1,0 +1,203 @@
+"""
+============================================================================
+ETL 07 - WATER POINTS (utilities.water_points)
+Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+Source: Water Point Data Exchange (WPDx), Kenya extract, downloaded from
+the Humanitarian Data Exchange. This is the catalogue PRIMARY for water
+points, a strong open dataset for rural water access.
+
+PREREQUISITE: run 01_database/04_schema_update_v1.3.sql first (adds the
+'other' and 'well' water point types this script may use).
+
+What this script does:
+  1. Reads wpdx_enhanced.csv, skipping the HXL tag row (row 2)
+  2. Keeps rows with valid Kenya coordinates
+  3. Maps WPDx source/tech types onto our point_type vocabulary
+  4. Reads functionality status into is_functional (true/false/NULL)
+  5. Builds point geometry from lon/lat, assigns county by spatial join
+  6. Loads into utilities.water_points with provenance
+
+How to run (from 03_etl with venv active):
+  python etl_07_wpdx_water_points.py
+============================================================================
+"""
+
+import os
+import sys
+from datetime import date
+from pathlib import Path
+
+import geopandas as gpd
+import pandas as pd
+from dotenv import load_dotenv
+from shapely.geometry import Point
+from sqlalchemy import create_engine, text
+
+BASE = Path(__file__).resolve().parent
+RAW = BASE / "data" / "raw" / "water_points"
+CSV = RAW / "wpdx_enhanced.csv"
+
+SOURCE_NAME = "WPDx"                 # matches sources.csv catalogue name
+SOURCE_URL = "https://data.humdata.org/dataset/wpdx_ken"
+SOURCE_DATE = date.today()
+PIPELINE = "etl_07_wpdx_water_points"
+
+
+def map_point_type(source, tech):
+    """Map WPDx free-text source/tech into our controlled vocabulary."""
+    s = f"{source} {tech}".lower()
+    if "spring" in s:
+        return "spring"
+    if "borehole" in s or "hand pump" in s or "handpump" in s \
+            or "mechan" in s or "submersible" in s:
+        return "borehole"
+    if "kiosk" in s or "tapstand" in s or "standpipe" in s or "tap" in s:
+        return "water_kiosk"
+    if "treatment" in s:
+        return "treatment_plant"
+    if "tank" in s or "storage" in s or "reservoir" in s:
+        return "storage_tank"
+    if "well" in s or "dug" in s:
+        return "well"
+    return "other"
+
+
+def map_functional(status_clean, status_id):
+    """Functionality into a clean boolean, NULL when genuinely unknown."""
+    for v in (str(status_clean), str(status_id)):
+        low = v.strip().lower()
+        if low in ("functional", "yes", "y", "functional and in use"):
+            return True
+        if "non" in low and "function" in low:
+            return False
+        if low in ("no", "n", "non functional", "non-functional"):
+            return False
+    return None
+
+
+load_dotenv(BASE / ".env")
+pw = os.getenv("DB_PASSWORD")
+if not pw or pw == "put_your_password_here":
+    sys.exit("ERROR: edit the .env file and set DB_PASSWORD first.")
+
+url = (
+    f"postgresql+psycopg2://{os.getenv('DB_USER', 'postgres')}:{pw}"
+    f"@{os.getenv('DB_HOST', 'localhost')}:{os.getenv('DB_PORT', '5432')}"
+    f"/{os.getenv('DB_NAME', 'land_intelligence_kenya')}"
+)
+engine = create_engine(url)
+with engine.connect() as conn:
+    conn.execute(text("SELECT 1"))
+print("Connected to database:", os.getenv("DB_NAME", "land_intelligence_kenya"))
+
+# Guard: v1.3 must be applied (the 'other'/'well' types).
+with engine.connect() as conn:
+    defn = conn.execute(text("""
+        SELECT pg_get_constraintdef(oid) FROM pg_constraint
+        WHERE conname = 'water_points_point_type_check'
+    """)).scalar()
+if not defn or "other" not in defn:
+    sys.exit("ERROR: run 01_database/04_schema_update_v1.3.sql first "
+             "(adds the 'other' water point type), then rerun.")
+
+with engine.begin() as conn:
+    conn.execute(text("CREATE SCHEMA IF NOT EXISTS staging"))
+    source_id = conn.execute(text("""
+        INSERT INTO metadata.sources
+            (name, organisation, tier, url, license,
+             redistribution_allowed, api_available, notes)
+        VALUES (:n, 'Water Point Data Exchange', 2, :u, 'CC-BY-4.0',
+                true, true, 'Kenya extract via HDX. Crowdsourced + govt water points.')
+        ON CONFLICT (name) DO UPDATE SET updated_at = now()
+        RETURNING source_id
+    """), {"n": SOURCE_NAME, "u": SOURCE_URL}).scalar()
+print(f"Source: {SOURCE_NAME} (source_id={source_id})")
+
+with engine.begin() as conn:
+    run_id = conn.execute(text("""
+        INSERT INTO metadata.etl_runs (pipeline, started_at, run_status)
+        VALUES (:p, now(), 'running') RETURNING run_id
+    """), {"p": PIPELINE}).scalar()
+print(f"ETL run opened (run_id={run_id})")
+
+try:
+    if not CSV.exists():
+        raise RuntimeError(f"{CSV} not found. Download the WPDx Kenya CSV "
+                           "to data/raw/water_points/wpdx_enhanced.csv")
+    # skiprows=[1] drops the HXL hashtag row while keeping the real header.
+    print(f"\nReading {CSV.name} (skipping HXL tag row)...")
+    df = pd.read_csv(CSV, skiprows=[1], low_memory=False)
+    print(f"   {len(df):,} rows read")
+
+    df = df[df["lat_deg"].notna() & df["lon_deg"].notna()].copy()
+    df["lat_deg"] = pd.to_numeric(df["lat_deg"], errors="coerce")
+    df["lon_deg"] = pd.to_numeric(df["lon_deg"], errors="coerce")
+    df = df.dropna(subset=["lat_deg", "lon_deg"])
+    # Kenya bounding box sanity filter (drops stray/bad coordinates).
+    df = df[(df["lat_deg"].between(-5.5, 5.5))
+            & (df["lon_deg"].between(33.5, 42.5))].copy()
+    print(f"   {len(df):,} rows with valid Kenya coordinates")
+
+    df["point_type"] = df.apply(
+        lambda r: map_point_type(r.get("water_source_clean", ""),
+                                 r.get("water_tech_clean", "")), axis=1)
+    df["is_functional"] = df.apply(
+        lambda r: map_functional(r.get("status_clean", ""),
+                                 r.get("status_id", "")), axis=1)
+    df["operator"] = df.get("management_clean")
+    df["gid"] = range(len(df))
+
+    print("   Point types found:")
+    for t, c in df["point_type"].value_counts().items():
+        print(f"      {t}: {c:,}")
+
+    gdf = gpd.GeoDataFrame(
+        df[["gid", "point_type", "is_functional", "operator"]].copy(),
+        geometry=[Point(xy) for xy in zip(df["lon_deg"], df["lat_deg"])],
+        crs=4326)
+
+    print(f"   Staging {len(gdf):,} points...")
+    gdf.to_postgis("water_points_raw", engine, schema="staging",
+                   if_exists="replace", chunksize=10000)
+
+    print("   Assigning counties and loading utilities.water_points...")
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE INDEX ON staging.water_points_raw USING gist (geometry)"))
+        conn.execute(text("ANALYZE staging.water_points_raw"))
+        conn.execute(text(
+            "DELETE FROM utilities.water_points WHERE source_id = :sid"),
+            {"sid": source_id})
+        n = conn.execute(text("""
+            INSERT INTO utilities.water_points
+                (point_type, name, operator, is_functional, county_code,
+                 geom, source_id, source_date, confidence)
+            SELECT w.point_type, NULL, w.operator, w.is_functional,
+                   c.county_code, w.geometry, :sid, :sd, 3
+            FROM staging.water_points_raw w
+            LEFT JOIN admin.counties c ON ST_Contains(c.geom, w.geometry)
+        """), {"sid": source_id, "sd": SOURCE_DATE}).rowcount
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'success', rows_out = :r
+            WHERE run_id = :id
+        """), {"r": n, "id": run_id})
+        conn.execute(text("""
+            UPDATE metadata.datasets SET etl_status = 'ingested', updated_at = now()
+            WHERE code = 'utilities.water_points'
+        """))
+    print(f"\nDONE. {n:,} water points loaded. Run {run_id} logged as success.")
+    print("Verify: SELECT point_type, is_functional, count(*) "
+          "FROM utilities.water_points GROUP BY 1,2 ORDER BY 1,2;")
+
+except Exception as exc:
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'failed', error_message = :e
+            WHERE run_id = :id
+        """), {"e": str(exc)[:2000], "id": run_id})
+    raise

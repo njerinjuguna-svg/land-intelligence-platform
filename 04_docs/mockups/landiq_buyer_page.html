@@ -1,0 +1,300 @@
+<title>LandIQ Plot Page</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+:root{
+  --paper:#F5F5F0; --card:#FFFFFF; --ink:#16201B; --ink-2:#4A574F;
+  --rule:#DFE1DA; --rule-2:#EDEEE9;
+  --brand:#1B5E43; --brand-soft:#E7F0EA;
+  --murram:#A85E24; --murram-soft:#F7EDE2;
+  --clay:#A0392B; --clay-soft:#F8E9E6;
+  --slate:#5D6B63; --slate-soft:#ECEEEB;
+  --shadow:0 1px 2px rgba(22,32,27,.05), 0 8px 24px -12px rgba(22,32,27,.14);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#0F1411; --card:#171E19; --ink:#E9EDE6; --ink-2:#A2AFA6;
+    --rule:#2A342D; --rule-2:#212A24;
+    --brand:#5FB18C; --brand-soft:#16281F;
+    --murram:#D2914F; --murram-soft:#2A2016;
+    --clay:#D97A67; --clay-soft:#2B1A17;
+    --slate:#94A29A; --slate-soft:#1D251F;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#0F1411; --card:#171E19; --ink:#E9EDE6; --ink-2:#A2AFA6;
+  --rule:#2A342D; --rule-2:#212A24;
+  --brand:#5FB18C; --brand-soft:#16281F;
+  --murram:#D2914F; --murram-soft:#2A2016;
+  --clay:#D97A67; --clay-soft:#2B1A17;
+  --slate:#94A29A; --slate-soft:#1D251F;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+}
+
+*{box-sizing:border-box}
+body{margin:0; background:var(--paper); color:var(--ink);
+  font-family:"Public Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  font-size:16px; line-height:1.55; -webkit-font-smoothing:antialiased}
+.wrap{max-width:1080px; margin:0 auto; padding:0 20px 72px}
+h1,h2,h3,.serif{font-family:"Newsreader",Georgia,serif; text-wrap:balance}
+.num{font-family:"IBM Plex Mono",ui-monospace,monospace; font-variant-numeric:tabular-nums}
+.eyebrow{font-size:11.5px; font-weight:600; letter-spacing:.13em; text-transform:uppercase;
+  color:var(--ink-2)}
+
+.seller{border-bottom:1px solid var(--rule); background:var(--card); margin-bottom:26px}
+.seller-in{max-width:1080px; margin:0 auto; padding:13px 20px; display:flex;
+  align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap}
+.seller-name{font-weight:700; letter-spacing:-.01em}
+.seller-note{font-size:12.5px; color:var(--ink-2)}
+
+/* --- identity ---------------------------------------------------------- */
+.identity{display:grid; grid-template-columns:1fr auto; gap:28px; align-items:end}
+@media(max-width:760px){.identity{grid-template-columns:1fr; align-items:start}}
+h1{font-size:clamp(29px,4.6vw,42px); line-height:1.08; margin:.26em 0 .16em;
+  font-weight:500; letter-spacing:-.015em}
+.sub{color:var(--ink-2); font-size:15px; margin:0}
+.price{font-size:clamp(21px,3vw,27px); font-weight:600; letter-spacing:-.01em; white-space:nowrap}
+.price small{display:block; font-size:12px; font-weight:400; color:var(--ink-2); margin-top:3px}
+.status-pill{display:inline-flex; align-items:center; gap:7px; font-size:12.5px; font-weight:600;
+  padding:4px 11px; border-radius:2px; background:var(--brand-soft); color:var(--brand);
+  border:1px solid var(--brand); margin-bottom:4px}
+.status-pill:before{content:""; width:6px; height:6px; border-radius:50%; background:currentColor}
+
+/* --- imagery ----------------------------------------------------------- */
+.media{display:grid; grid-template-columns:2fr 1fr; gap:12px; margin-top:22px}
+@media(max-width:760px){.media{grid-template-columns:1fr}}
+.slot{border:1px dashed var(--rule); border-radius:4px; background:var(--card);
+  display:grid; place-content:center; text-align:center; gap:7px; padding:26px;
+  color:var(--ink-2); min-height:210px}
+.slot.big{aspect-ratio:16/10}
+.slot b{color:var(--ink); font-size:15px; font-family:"Public Sans",sans-serif}
+.slot span{font-size:12.5px; max-width:38ch; line-height:1.5}
+.slot .tag{font-size:10.5px; letter-spacing:.12em; text-transform:uppercase; font-weight:600;
+  color:var(--brand)}
+.actions{display:flex; gap:10px; flex-wrap:wrap; margin-top:12px}
+.btn{display:inline-flex; align-items:center; gap:8px; font-size:14px; font-weight:600;
+  padding:11px 18px; border-radius:3px; text-decoration:none; border:1px solid var(--brand);
+  background:var(--brand); color:var(--paper)}
+.btn.ghost{background:transparent; color:var(--brand)}
+.btn:hover{filter:brightness(1.08)}
+
+/* --- fact strip -------------------------------------------------------- */
+.facts{display:grid; grid-template-columns:repeat(4,1fr); gap:1px; margin-top:34px;
+  background:var(--rule); border:1px solid var(--rule); border-radius:4px; overflow:hidden}
+@media(max-width:840px){.facts{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:460px){.facts{grid-template-columns:1fr}}
+.fact{background:var(--card); padding:18px 20px}
+.fact .k{font-size:11.5px; font-weight:600; letter-spacing:.11em; text-transform:uppercase;
+  color:var(--ink-2); margin-bottom:6px}
+.fact .v{font-family:"Newsreader",serif; font-size:21px; font-weight:500; line-height:1.15;
+  letter-spacing:-.012em}
+.fact .n{font-size:13px; color:var(--ink-2); margin-top:5px}
+
+section{margin-top:52px}
+.sec-head h2{font-size:24px; font-weight:500; margin:0 0 4px; letter-spacing:-.012em}
+.sec-sub{color:var(--ink-2); font-size:14px; margin:0 0 20px; max-width:66ch}
+
+/* --- distances --------------------------------------------------------- */
+.two{display:grid; grid-template-columns:1fr 1fr; gap:26px}
+@media(max-width:800px){.two{grid-template-columns:1fr}}
+.rows{background:var(--card); border:1px solid var(--rule); border-radius:4px; overflow:hidden}
+.row{display:grid; grid-template-columns:1fr auto auto; gap:14px; align-items:baseline;
+  padding:11px 17px; border-bottom:1px solid var(--rule-2)}
+.row:last-child{border-bottom:0}
+@media(max-width:520px){.row{grid-template-columns:1fr auto}.row .m{grid-column:2}}
+.row .t{font-size:14.5px}
+.row .w{font-size:13.5px; color:var(--ink-2); text-align:right}
+.row .m{font-size:13.5px; color:var(--ink-2); text-align:right; min-width:66px}
+.row.onland{background:var(--brand-soft)} .row.onland .t{font-weight:600; color:var(--brand)}
+.list-title{font-size:11.5px; font-weight:600; letter-spacing:.11em; text-transform:uppercase;
+  color:var(--ink-2); margin:0 0 9px}
+
+/* --- scheme map -------------------------------------------------------- */
+.scheme{background:var(--card); border:1px solid var(--rule); border-radius:4px; padding:26px 28px}
+.scheme-top{display:flex; justify-content:space-between; gap:20px; flex-wrap:wrap;
+  align-items:baseline; margin-bottom:20px}
+.remaining{font-family:"Newsreader",serif; font-size:26px; font-weight:500; letter-spacing:-.015em}
+.remaining b{color:var(--brand); font-family:"IBM Plex Mono",monospace; font-weight:600}
+.legend{display:flex; gap:16px; flex-wrap:wrap; font-size:12.5px; color:var(--ink-2)}
+.legend i{display:inline-block; width:11px; height:11px; border-radius:2px; margin-right:6px;
+  vertical-align:-1px; border:1px solid rgba(0,0,0,.12)}
+.plotmap{width:100%; height:auto; display:block; overflow:visible}
+.plotmap text{font-family:"IBM Plex Mono",monospace; font-size:7.4px; font-weight:600}
+
+/* --- footer ------------------------------------------------------------ */
+.limits{margin-top:52px; padding-top:22px; border-top:1px solid var(--rule);
+  font-size:12.5px; color:var(--ink-2); max-width:82ch}
+.limits p{margin:0 0 8px}
+.attr{font-size:11.5px; color:var(--ink-2); margin-top:16px; line-height:1.7;
+  padding-top:14px; border-top:1px solid var(--rule-2)}
+.note{margin:34px 0 0; padding:16px 20px; border-radius:4px; font-size:13.5px;
+  background:var(--slate-soft); border:1px dashed var(--rule); color:var(--ink-2)}
+.note b{color:var(--ink)}
+:focus-visible{outline:2px solid var(--brand); outline-offset:2px}
+@media(prefers-reduced-motion:reduce){*{animation:none!important; transition:none!important}}
+</style>
+
+<div class="seller">
+  <div class="seller-in">
+    <div class="seller-name">Oak Grove Gardens</div>
+    <div class="seller-note">Plot intelligence by Geocode Spatial Solutions Ltd</div>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <div class="identity">
+    <div>
+      <span class="status-pill">Available</span>
+      <div class="eyebrow">Plot 457 · Oak Grove · Kiambu County</div>
+      <h1>An eighth-acre plot, off the main road</h1>
+      <p class="sub"><span class="num">0.14</span> acres · measured from the boundary the seller supplied</p>
+    </div>
+    <div class="price">Price on request<small>Talk to Oak Grove Gardens</small></div>
+  </div>
+
+  <div class="media">
+    <div class="slot big">
+      <span class="tag">Satellite view</span>
+      <b>The plot outlined on satellite imagery</b>
+      <span>Google Maps satellite tile, with this plot's boundary drawn over it. The boundary is the seller's own survey data, so nothing is licensed from anyone else here.</span>
+    </div>
+    <div class="slot">
+      <span class="tag">Street view</span>
+      <b>The nearest road-level view</b>
+      <span>Shown when Google has coverage on the access road. Many Kenyan estate roads have none — the panel is hidden rather than faked when it is missing.</span>
+    </div>
+  </div>
+
+  <div class="actions">
+    <a class="btn" href="#">Get directions to this plot</a>
+    <a class="btn ghost" href="#">Book a site visit</a>
+    <a class="btn ghost" href="#">Download the full report</a>
+  </div>
+
+  <div class="facts">
+    <div class="fact">
+      <div class="k">Soil</div>
+      <div class="v">Deep red volcanic</div>
+      <div class="n">Nitisol — the coffee soil of this region. Fertile, clay-rich, drains well</div>
+    </div>
+    <div class="fact">
+      <div class="k">Rainfall</div>
+      <div class="v">Reliable</div>
+      <div class="n">About 1,000 mm a year — enough for maize and a kitchen garden without irrigation</div>
+    </div>
+    <div class="fact">
+      <div class="k">Flooding</div>
+      <div class="v">Not expected</div>
+      <div class="n">The plot sheds water rather than collecting it</div>
+    </div>
+    <div class="fact">
+      <div class="k">Ground</div>
+      <div class="v">Gently sloping</div>
+      <div class="n">About 3 in 100 — easy to build on, and water runs off rather than sitting</div>
+    </div>
+  </div>
+
+  <section>
+    <div class="sec-head"><h2>Getting around</h2></div>
+    <p class="sec-sub">Straight-line distances to the nearest of each, with walking at 5 km/h and driving at 40 km/h.</p>
+    <div class="two">
+      <div>
+        <p class="list-title">Day to day</p>
+        <div class="rows">
+          <div class="row"><div class="t">Main road</div><div class="w">1 min walk</div><div class="m num">59 m</div></div>
+          <div class="row"><div class="t">Primary school</div><div class="w">9 min walk</div><div class="m num">744 m</div></div>
+          <div class="row"><div class="t">Mobile network mast</div><div class="w">13 min walk</div><div class="m num">1.0 km</div></div>
+          <div class="row"><div class="t">Clinic</div><div class="w">17 min walk</div><div class="m num">1.3 km</div></div>
+          <div class="row"><div class="t">Hospital</div><div class="w">17 min walk</div><div class="m num">1.3 km</div></div>
+          <div class="row"><div class="t">Water point</div><div class="w">20 min walk</div><div class="m num">1.6 km</div></div>
+          <div class="row"><div class="t">Tarmac road</div><div class="w">4 min drive</div><div class="m num">2.4 km</div></div>
+          <div class="row"><div class="t">Secondary school</div><div class="w">4 min drive</div><div class="m num">2.7 km</div></div>
+        </div>
+      </div>
+      <div>
+        <p class="list-title">Landmarks near this area</p>
+        <div class="rows">
+          <div class="row"><div class="t">Juja town centre</div><div class="w">8 min drive</div><div class="m num">5.1 km</div></div>
+          <div class="row"><div class="t">Thika-Mang'u Road</div><div class="w">8 min drive</div><div class="m num">5.3 km</div></div>
+          <div class="row"><div class="t">Market</div><div class="w">8 min drive</div><div class="m num">5.0 km</div></div>
+          <div class="row"><div class="t">Bus and matatu stage</div><div class="w">8 min drive</div><div class="m num">5.5 km</div></div>
+          <div class="row"><div class="t">Ruiru Railway Station</div><div class="w">15 min drive</div><div class="m num">10.1 km</div></div>
+          <div class="row"><div class="t">Jomo Kenyatta International Airport</div><div class="w">43 min drive</div><div class="m num">28.8 km</div></div>
+        </div>
+        <p class="foot-note">Straight-line distances. Driving times assume 40 km/h and will be longer in Nairobi traffic.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>Power and network</h2></div>
+    <p class="sec-sub">What reaches this plot, and how far away the nearest connection point is.</p>
+    <div class="two">
+      <div>
+        <p class="list-title">Mobile network</p>
+        <div class="rows">
+          <div class="row"><div class="t">4G</div><div class="w">Available</div><div class="m num">98%</div></div>
+          <div class="row"><div class="t">2G calls and SMS</div><div class="w">Available</div><div class="m num">100%</div></div>
+          <div class="row"><div class="t">Nearest mast</div><div class="w">13 min walk</div><div class="m num">1.0 km</div></div>
+          <div class="row"><div class="t">Safaricom</div><div class="w">—</div><div class="m">pending CA</div></div>
+          <div class="row"><div class="t">Airtel</div><div class="w">—</div><div class="m">not held</div></div>
+          <div class="row"><div class="t">Telkom</div><div class="w">—</div><div class="m">pending CA</div></div>
+        </div>
+        <p class="sec-sub" style="margin-top:11px">Coverage is published by the Communications Authority for the whole sublocation, not for this plot. Naming operators is held until the CA confirms which service each layer belongs to.</p>
+      </div>
+      <div>
+        <p class="list-title">Power and water</p>
+        <div class="rows">
+          <div class="row"><div class="t">Nearest KPLC line</div><div class="w">—</div><div class="m">not yet loaded</div></div>
+          <div class="row"><div class="t">Nearest transformer</div><div class="w">—</div><div class="m">not yet loaded</div></div>
+          <div class="row"><div class="t">Water point</div><div class="w">20 min walk</div><div class="m num">1.6 km</div></div>
+          <div class="row"><div class="t">Piped water line</div><div class="w">—</div><div class="m">not yet loaded</div></div>
+        </div>
+        <p class="sec-sub" style="margin-top:11px">A transformer within about 600 m is usually the difference between a normal connection quote and an expensive one, which is why the distance matters more than a yes or no.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>The rest of Oak Grove</h2></div>
+    <p class="sec-sub">Which plots in this scheme are still open, and which are spoken for.</p>
+    <div class="scheme">
+      <div class="scheme-top">
+        <div class="remaining"><b>8</b> of 8 plots still available</div>
+        <div class="legend">
+          <span><i style="background:#E7F0EA;border-color:#1B5E43"></i>Available</span>
+          <span><i style="background:#F7EDE2;border-color:#A85E24"></i>Deposit paid</span>
+          <span><i style="background:#ECEEEB;border-color:#9AA69E"></i>Sold</span>
+        </div>
+      </div>
+      <div class="rows">
+        <div class="row"><div class="t">Plot 365</div><div class="w">Available</div><div class="m num">2.22 acres</div></div>
+        <div class="row"><div class="t">Plot 379</div><div class="w">Available</div><div class="m num">2.31 acres</div></div>
+        <div class="row"><div class="t">Plot 395</div><div class="w">Available</div><div class="m num">0.31 acres</div></div>
+        <div class="row"><div class="t">Plot 400</div><div class="w">Available</div><div class="m num">0.56 acres</div></div>
+        <div class="row onland"><div class="t">Plot 457 — the one you are viewing</div><div class="w">Available</div><div class="m num">0.14 acres</div></div>
+        <div class="row"><div class="t">Plot 950</div><div class="w">Available</div><div class="m num">8.50 acres</div></div>
+        <div class="row"><div class="t">Plot 1069</div><div class="w">Available</div><div class="m num">0.46 acres</div></div>
+        <div class="row"><div class="t">Plot 1070</div><div class="w">Available</div><div class="m num">0.46 acres</div></div>
+      </div>
+      <p class="foot-note">Availability comes from Oak Grove Gardens’ own records and updates as plots are taken. Sizes are measured from the surveyed boundaries.</p>
+    </div>
+  </section>
+
+  <div class="limits">
+    <p>Distances and ground conditions on this page are measured from satellite images, terrain and rainfall records.</p>
+    <div class="attr">
+      Geocode Spatial Solutions Ltd · report v0.1.0 · intelligence v7 · 24 August 2026<br>
+      Roads and rivers © OpenStreetMap contributors, ODbL 1.0. Terrain from Copernicus GLO-30. Rainfall from CHIRPS. Soils from SoilGrids and iSDAsoil.
+    </div>
+  </div>
+
+  <div class="note">
+    <b>About this mockup.</b> Every figure on this page is a real value for PLOT-457 from the enrichment run — distances, acreage, rainfall, soil, flood and the eight plots in the scheme. Nothing is placeholder data: there is no price because the database holds none, and all eight plots read available because that is what the seller’s records say. Two panels are staged rather than live: the satellite and Street View slots need a Google Maps key, and the plot photographs come from the seller’s own listing.
+  </div>
+
+</div>

@@ -1,0 +1,447 @@
+"""
+============================================================================
+ETL 20 - GHSL BUILT-UP SURFACE (satellite.builtup) at 3 arcsec (~92 m)
+Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+What this script does:
+  Downloads the GHS-BUILT-S R2023A epoch 2020 tiles covering Kenya, mosaics
+  them, and catalogues the result as satellite.builtup.
+
+WHAT THIS LAYER IS, AND WHY IT IS NOT THE SAME AS LAND COVER
+  etl_19 gave us WorldCover, where "Built-up" is one of eleven classes: a
+  pixel either is built or it is not. That answers "is there a building here".
+  It cannot answer "how developed is this area", because a lone farmhouse and
+  the middle of Nairobi both come out as simply built.
+
+  GHS-BUILT-S is different in kind. Each cell stores the number of SQUARE
+  METRES of building surface inside it. So a cell can be 3% built or 80%
+  built, and the difference between a scattered rural settlement and a dense
+  town centre becomes a number instead of a category.
+
+  That is precisely the shape of the question our catalogue records for this
+  dataset: "percent built within 1 km of parcel", which drives "is the area
+  developing". A buyer choosing between two plots priced the same cares
+  enormously whether one sits beside a thickening town edge and the other
+  beside nothing.
+
+WHY WE STORE SQUARE METRES AND NOT A PERCENTAGE
+  It is tempting to convert to "percent built" here and store a tidy 0-100.
+  We deliberately do not, for two reasons:
+    1. In EPSG:4326 a cell is not a constant area. It shrinks as you move away
+       from the equator, because lines of longitude converge. Kenya spans
+       about 5 degrees either side of the equator, so cell area varies by a
+       few tenths of a percent across the country. Converting to a percentage
+       here would bake one assumed cell area into the stored numbers forever.
+    2. Square metres ADD. To get "percent built within 1 km" the enrichment
+       engine will sum the built surface over a neighbourhood and divide by
+       that neighbourhood's true area. Sums of percentages are meaningless;
+       sums of square metres are exactly right.
+  So we keep the honest quantity and let the consumer divide. The catalogue
+  entry says so explicitly.
+
+Resolution choice (deliberate, and a departure from the catalogue's "10 m"):
+  GHSL publishes a 10 m version, but ONLY in Mollweide (ESRI:54009), which
+  would need reprojecting a large global grid. The 3 arcsec version is
+  published natively in EPSG:4326, needs no reprojection at all, and is about
+  92 m. For a statistic that is explicitly averaged over a 1 km neighbourhood,
+  92 m cells are more than sufficient: we would be reprojecting a great deal
+  of data to compute the same number. WorldCover already supplies the 10 m
+  "is this specific spot built" signal. Recorded here so the choice is not
+  mistaken later for an oversight.
+
+Epoch choice:
+  E2020 is the most recent OBSERVED epoch. R2023A also ships 2025 and 2030,
+  but those are MODELLED PROJECTIONS. A projection is a forecast, and we do
+  not sell forecasts as measurements. If we later want a growth layer
+  (satellite.urban_growth, P2), the honest way is E2020 minus E2015, both
+  observed.
+
+Licence: free with attribution, European Commission JRC.
+
+How to run (from 03_etl with venv active):
+  python etl_20_ghsl_builtup.py
+============================================================================
+"""
+
+import os
+import sys
+import time
+import math
+import zipfile
+import hashlib
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+for _k in ("PROJ_LIB", "PROJ_DATA", "GDAL_DATA"):
+    os.environ.pop(_k, None)
+
+import numpy as np
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+try:
+    import rasterio
+    from rasterio.windows import Window
+    from rasterio.shutil import copy as rio_copy
+except ImportError:
+    sys.exit("ERROR: rasterio missing. With venv active: pip install rasterio")
+
+BASE = Path(__file__).resolve().parent
+PROJECT = BASE.parent
+PIPELINE = "etl_20_ghsl_builtup"
+
+RAW_DIR = BASE / "data" / "raw" / "satellite" / "ghsl"
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+COG_DIR = PROJECT / "06_rasters" / "cog" / "satellite"
+COG_DIR.mkdir(parents=True, exist_ok=True)
+
+EPOCH = 2020
+COG_NAME = f"satellite_builtup_ghsl_92m_{EPOCH}.tif"
+COG_PATH = COG_DIR / COG_NAME
+TMP_PATH = RAW_DIR / "_mosaic_tmp.tif"
+
+PAD_DEG = 0.02
+NODATA = 65535                 # uint16: real values are m2 per cell, 0..~8600
+STRIP = 2048
+
+FTP = "https://jeodpp.jrc.ec.europa.eu/ftp/jrc-opendata/GHSL"
+PROD = f"GHS_BUILT_S_E{EPOCH}_GLOBE_R2023A_4326_3ss"
+DIR = f"{FTP}/GHS_BUILT_S_GLOBE_R2023A/{PROD}/V1-0"
+
+ATTRIB = ("GHS-BUILT-S R2023A, European Commission Joint Research Centre "
+          "(JRC), Pesaresi & Politis 2023. Free with attribution.")
+
+# GHSL splits its EPSG:4326 products into 10 x 10 degree tiles named R<row>_
+# C<col>, numbered from the north west corner of the world. We compute the
+# tiles Kenya needs from that rule and then PROVE the rule by asking the
+# server, rather than trusting it. If the naming has changed the script stops
+# and tells you where to look, instead of silently downloading nothing.
+TILE_DEG = 10
+
+
+def tile_rc(lat, lon):
+    """Tile row and column containing this point, 1-based from the top left."""
+    c = int((lon + 180) // TILE_DEG) + 1
+    r = int((90 - lat) // TILE_DEG) + 1
+    return r, c
+
+
+def tile_url(r, c):
+    return f"{DIR}/tiles/{PROD}_V1_0_R{r}_C{c}.zip"
+
+
+def md5_of(path, chunk=8 * 1024 * 1024):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def head_ok(url, timeout=60):
+    try:
+        req = urllib.request.Request(url, method="HEAD",
+                                     headers={"User-Agent": "LIP-ETL/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def download(url, dest, retries=5, timeout=300):
+    part = dest.with_suffix(dest.suffix + ".part")
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "LIP-ETL/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r, \
+                    open(part, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            part.replace(dest)
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 404):
+                part.unlink(missing_ok=True)
+                return False
+        except (urllib.error.URLError, TimeoutError, OSError):
+            pass
+        part.unlink(missing_ok=True)
+        time.sleep(3 * attempt)
+    return False
+
+
+load_dotenv(BASE / ".env")
+pw = os.getenv("DB_PASSWORD")
+if not pw or pw == "put_your_password_here":
+    sys.exit("ERROR: edit the .env file and set DB_PASSWORD first.")
+
+engine = create_engine(
+    f"postgresql+psycopg2://{os.getenv('DB_USER', 'postgres')}:{pw}"
+    f"@{os.getenv('DB_HOST', 'localhost')}:{os.getenv('DB_PORT', '5432')}"
+    f"/{os.getenv('DB_NAME', 'land_intelligence_kenya')}")
+with engine.connect() as conn:
+    conn.execute(text("SELECT 1"))
+print("Connected to database:", os.getenv("DB_NAME", "land_intelligence_kenya"))
+
+with engine.begin() as conn:
+    run_id = conn.execute(text("""
+        INSERT INTO metadata.etl_runs (pipeline, started_at, run_status)
+        VALUES (:p, now(), 'running') RETURNING run_id
+    """), {"p": PIPELINE}).scalar()
+print(f"ETL run opened (run_id={run_id})")
+
+try:
+    with engine.connect() as conn:
+        xmin, xmax, ymin, ymax = conn.execute(text("""
+            SELECT ST_XMin(e), ST_XMax(e), ST_YMin(e), ST_YMax(e)
+            FROM (SELECT ST_Extent(geom) AS e FROM admin.country) t
+        """)).one()
+        source_id = conn.execute(text(
+            "SELECT source_id FROM metadata.sources WHERE name = 'GHSL'")).scalar()
+        dataset_id = conn.execute(text(
+            "SELECT dataset_id FROM metadata.datasets "
+            "WHERE code = 'satellite.builtup'")).scalar()
+    if source_id is None or dataset_id is None:
+        raise SystemExit("GHSL source or satellite.builtup dataset missing. "
+                         "Run etl_04 first.")
+
+    xmin, xmax = float(xmin) - PAD_DEG, float(xmax) + PAD_DEG
+    ymin, ymax = float(ymin) - PAD_DEG, float(ymax) + PAD_DEG
+    print(f"Kenya bbox (padded): lon {xmin:.3f}..{xmax:.3f}, "
+          f"lat {ymin:.3f}..{ymax:.3f}")
+
+    # -----------------------------------------------------------------------
+    # 1. Which tiles, and does the naming rule actually hold?
+    # -----------------------------------------------------------------------
+    r_lo, _ = tile_rc(ymax, xmin)
+    r_hi, _ = tile_rc(ymin, xmin)
+    _, c_lo = tile_rc(ymax, xmin)
+    _, c_hi = tile_rc(ymax, xmax)
+    wanted = [(r, c) for r in range(r_lo, r_hi + 1)
+              for c in range(c_lo, c_hi + 1)]
+    print(f"Tiles needed by the 10-degree rule: "
+          f"{', '.join(f'R{r}_C{c}' for r, c in wanted)}")
+
+    print("\nProbing the first tile to confirm the URL layout ...")
+    probe = tile_url(*wanted[0])
+    print(f"  {probe}")
+    if not head_ok(probe):
+        raise SystemExit(
+            "That URL did not respond. The GHSL naming or folder layout has "
+            "probably changed.\nOpen this in a browser and tell me the real "
+            f"file names:\n  {DIR}/tiles/\n"
+            "Nothing was downloaded and nothing was catalogued.")
+    print("  OK, the layout is as expected.")
+
+    # -----------------------------------------------------------------------
+    # 2. Download and unzip
+    # -----------------------------------------------------------------------
+    tifs = []
+    for i, (r, c) in enumerate(wanted, 1):
+        zpath = RAW_DIR / f"{PROD}_V1_0_R{r}_C{c}.zip"
+        tag = f"R{r}_C{c}"
+        if not (zpath.exists() and zpath.stat().st_size > 100_000):
+            print(f"  [{i}/{len(wanted)}] {tag} downloading ...", flush=True)
+            if not download(tile_url(r, c), zpath):
+                print(f"       {tag} not available, skipping")
+                continue
+        else:
+            print(f"  [{i}/{len(wanted)}] {tag} already have the zip")
+
+        with zipfile.ZipFile(zpath) as z:
+            members = [m for m in z.namelist() if m.lower().endswith(".tif")]
+            if not members:
+                print(f"       {tag} zip contains no .tif, skipping")
+                continue
+            out = RAW_DIR / Path(members[0]).name
+            if not out.exists():
+                with z.open(members[0]) as fsrc, open(out, "wb") as fdst:
+                    while True:
+                        chunk = fsrc.read(1 << 20)
+                        if not chunk:
+                            break
+                        fdst.write(chunk)
+            tifs.append(out)
+            print(f"       {tag} ready ({out.stat().st_size/1e6:.0f} MB)")
+
+    if not tifs:
+        raise SystemExit("No GHSL tiles obtained. Nothing catalogued.")
+    print(f"\n{len(tifs)} tiles ready")
+
+    # -----------------------------------------------------------------------
+    # 3. Mosaic over Kenya, sweeping the canvas in bands (see etl_19 for why)
+    # -----------------------------------------------------------------------
+    with rasterio.open(tifs[0]) as s0:
+        px = s0.transform.a
+        src_dtype = s0.dtypes[0]
+        src_nodata = s0.nodata
+    print(f"Source: {src_dtype}, nodata {src_nodata}, "
+          f"pixel {px:.8f} deg (~{px * 111320:.0f} m)")
+
+    x0 = math.floor(xmin / px) * px
+    x1 = math.ceil(xmax / px) * px
+    y0 = math.floor(ymin / px) * px
+    y1 = math.ceil(ymax / px) * px
+    W = int(round((x1 - x0) / px))
+    H = int(round((y1 - y0) / px))
+    print(f"National canvas: {W:,} x {H:,} px ({W * H / 1e6:.0f} million)")
+
+    prof = {
+        "driver": "GTiff", "dtype": "uint16", "count": 1,
+        "crs": "EPSG:4326",
+        "transform": rasterio.Affine(px, 0, x0, 0, -px, y1),
+        "width": W, "height": H, "nodata": NODATA,
+        "tiled": True, "blockxsize": 512, "blockysize": 512,
+        "compress": "DEFLATE", "predictor": 2, "bigtiff": "YES",
+    }
+
+    handles = []
+    for tp in tifs:
+        src = rasterio.open(tp)
+        handles.append({"src": src,
+                        "col0": int(round((src.transform.c - x0) / px)),
+                        "row0": int(round((y1 - src.transform.f) / px))})
+        print(f"  {tp.name[-12:-4]} at canvas col {handles[-1]['col0']:,}, "
+              f"row {handles[-1]['row0']:,}")
+
+    total_m2 = 0.0
+    max_val = 0
+    try:
+        with rasterio.open(TMP_PATH, "w", **prof) as dst:
+            nb = math.ceil(H / STRIP)
+            for si, r in enumerate(range(0, H, STRIP), 1):
+                rh = min(STRIP, H - r)
+                buf = np.full((rh, W), NODATA, dtype="uint16")
+                for t in handles:
+                    src = t["src"]
+                    rf, rt = max(r, t["row0"]), min(r + rh, t["row0"] + src.height)
+                    cf, ct = max(0, t["col0"]), min(W, t["col0"] + src.width)
+                    if rt <= rf or ct <= cf:
+                        continue
+                    a = src.read(1, window=Window(cf - t["col0"], rf - t["row0"],
+                                                  ct - cf, rt - rf))
+                    # GHSL ships this product as float in some releases and as
+                    # an integer in others, so normalise before doing anything
+                    # arithmetic rather than assuming.
+                    a = a.astype("float32", copy=False)
+                    a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+                    if src_nodata is not None:
+                        a[a == src_nodata] = 0.0
+                    # An unbuilt cell is a real, meaningful zero here, not
+                    # missing data: it says "we looked and found no building".
+                    # That distinction matters for averaging over a 1 km
+                    # neighbourhood, where treating zeros as gaps would inflate
+                    # every result.
+                    np.clip(a, 0, 65534, out=a)
+                    buf[rf - r:rt - r, cf:ct] = a.astype("uint16")
+                    del a
+                real = buf != NODATA
+                if real.any():
+                    total_m2 += float(buf[real].sum())
+                    max_val = max(max_val, int(buf[real].max()))
+                dst.write(buf, 1, window=Window(0, r, W, rh))
+                del buf, real
+                if si % 5 == 0 or si == nb:
+                    print(f"  band {si}/{nb} ({100*si/nb:5.1f}%)", flush=True)
+    finally:
+        for t in handles:
+            t["src"].close()
+
+    # -----------------------------------------------------------------------
+    # 4. Sanity check before cataloguing
+    # -----------------------------------------------------------------------
+    cell_m2 = (px * 111320) * (px * 110574)      # at the equator
+    print(f"\n  cell size ~{px*111320:.0f} x {px*110574:.0f} m "
+          f"= {cell_m2:,.0f} m2 at the equator")
+    print(f"  maximum cell value: {max_val:,} m2 "
+          f"({100.0 * max_val / cell_m2:.0f}% of a cell)")
+    print(f"  total built-up surface over the canvas: "
+          f"{total_m2 / 1e6:,.0f} km2")
+    print("  (Kenya's built-up surface should land in the low thousands of "
+          "km2. For scale, Nairobi county is 696 km2 in total.)")
+    if max_val > cell_m2 * 1.05:
+        raise SystemExit(
+            f"A cell claims {max_val:,} m2 of building inside a {cell_m2:,.0f} "
+            f"m2 cell. That is impossible, so the units are not what we think. "
+            f"Refusing to catalogue.")
+    if total_m2 / 1e6 > 100_000:
+        raise SystemExit(f"{total_m2/1e6:,.0f} km2 built up is larger than "
+                         f"Kenya itself (580,367 km2). Refusing to catalogue.")
+
+    # -----------------------------------------------------------------------
+    # 5. COG + catalogue
+    # -----------------------------------------------------------------------
+    print("\nConverting to COG ...")
+    if COG_PATH.exists():
+        COG_PATH.unlink()
+    rio_copy(str(TMP_PATH), str(COG_PATH), driver="COG",
+             compress="DEFLATE", predictor=2,
+             overview_resampling="average", BIGTIFF="YES")
+    TMP_PATH.unlink(missing_ok=True)
+    print(f"COG written: {COG_PATH.name} "
+          f"({COG_PATH.stat().st_size/1e6:.0f} MB)")
+
+    with rasterio.open(COG_PATH) as s:
+        b = s.bounds
+        print(f"  {s.width:,} x {s.height:,} px, overviews {s.overviews(1)}")
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            DELETE FROM metadata.raster_catalog
+            WHERE dataset_id = :did AND variable = 'builtup'
+        """), {"did": dataset_id})
+        conn.execute(text("""
+            INSERT INTO metadata.raster_catalog
+                (dataset_id, name, variable, storage_url, format, pixel_size_m,
+                 band_count, nodata_value, temporal_start, temporal_end, bbox,
+                 checksum, source_id, source_date, confidence)
+            VALUES
+                (:did, :name, 'builtup', :url, 'COG', :px, 1, :nodata,
+                 :ts, :te, ST_MakeEnvelope(:l, :b, :r, :t, 4326),
+                 :chk, :sid, DATE '2023-01-01', 4)
+        """), {
+            "did": dataset_id,
+            "name": (f"GHS-BUILT-S R2023A epoch {EPOCH}, built-up surface in "
+                     f"SQUARE METRES per cell (NOT a percentage). Cell is 3 "
+                     f"arcsec, about {cell_m2:,.0f} m2 at the equator and "
+                     f"slightly smaller further from it. To get percent built "
+                     f"over an area, SUM the square metres and divide by that "
+                     f"area's true size. 65535 = nodata. Observed epoch, not a "
+                     f"projection. " + ATTRIB),
+            "url": str(COG_PATH),
+            "px": round(px * 111320, 1),
+            "nodata": NODATA,
+            "ts": f"{EPOCH}-01-01", "te": f"{EPOCH}-12-31",
+            "l": float(b.left), "b": float(b.bottom),
+            "r": float(b.right), "t": float(b.top),
+            "chk": md5_of(COG_PATH), "sid": source_id,
+        })
+        conn.execute(text("""
+            UPDATE metadata.datasets SET etl_status = 'ingested', updated_at = now()
+            WHERE code = 'satellite.builtup'
+        """))
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'success', rows_out = 1
+            WHERE run_id = :id
+        """), {"id": run_id})
+
+    print(f"\nDONE. Run {run_id} logged as success.")
+    print("Next: run verify_20_builtup.py. The decisive check is that the most "
+          "built-up cells in the country turn out to be Nairobi, Mombasa, "
+          "Kisumu, Nakuru and Eldoret, in roughly that order. If the layer "
+          "instead peaks somewhere empty, it is misplaced.")
+
+except Exception as exc:
+    TMP_PATH.unlink(missing_ok=True)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'failed', error_message = :e
+            WHERE run_id = :id
+        """), {"e": str(exc)[:2000], "id": run_id})
+    raise

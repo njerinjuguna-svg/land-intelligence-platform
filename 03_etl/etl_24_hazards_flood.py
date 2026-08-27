@@ -1,0 +1,1173 @@
+"""
+============================================================================
+ETL 24 - FLOOD HAZARD (hazards.flood) at ~93 m, MODELLED
+Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+READ THIS FIRST. THIS LAYER IS MODELLED, NOT MEASURED.
+  Everything else in the database is an observation: a satellite saw it, a
+  gauge recorded it, a surveyor mapped it. This layer is our own reasoning
+  about where water is likely to go. It carries confidence 3 and the word
+  MODELLED in its catalogue entry, and it must carry that word into every
+  report a buyer ever sees.
+
+  That matters more here than anywhere else in the platform, because flood is
+  the one output where being wrong hurts someone directly. Telling a buyer a
+  plot is safe when it floods is worse than telling them nothing. So this
+  layer is built to be conservative, explainable, and clearly labelled as a
+  screening tool that does not replace a site visit or a hydrological study.
+
+WHAT IT COMBINES, AND WHY EACH ONE IS THERE
+  1. HAND, Height Above Nearest Drainage. The single best cheap predictor of
+     flood exposure. Not "how close is the river" but "how far above it are
+     you", which is the question that actually decides whether water reaches
+     you. A plot 200 m from a river but 30 m above it is safe; a plot 2 km
+     away on the floodplain at the same level as the river is not.
+  2. TWI, from etl_16. Where water accumulates on the local terrain,
+     independent of rivers. Catches waterlogging and ponding that HAND misses.
+  3. Slope, from etl_15. Flat ground holds water; steep ground sheds it.
+  4. JRC Global Surface Water occurrence, 1984-2021. How often each pixel was
+     ACTUALLY under water across 37 years of Landsat. This is the only
+     OBSERVED input and it anchors the modelled ones: where JRC has seen water
+     repeatedly, we are not guessing.
+
+HOW HAND IS COMPUTED HERE (rebuilt in run 58; see the postmortem below)
+  HAND is derived by FLOW ROUTING, the textbook method. For every cell we
+  follow the water downhill, step by step, until it reaches a channel, and
+  subtract that channel's elevation from the cell's own.
+
+    1. Condition the DEM (pysheds): fill pits, fill depressions, resolve flats,
+       so simulated water never gets stuck in a one-pixel trap.
+    2. Flow direction (D8): for each cell, which of its eight neighbours does
+       water leave through.
+    3. Flow accumulation: how much upslope land drains through each cell.
+    4. Channels: cells whose accumulated drainage area exceeds
+       CHANNEL_MIN_KM2. This is what "a watercourse large enough to carry a
+       flood" means physically, rather than whether anyone mapped it.
+    5. For each cell, walk downslope to the first channel it reaches. HAND is
+       this cell's elevation minus THAT channel's elevation.
+
+  Two properties follow from the method itself, and both were missing before:
+    - The channel you are measured against is the one you ACTUALLY DRAIN TO.
+    - HAND is guaranteed non-negative, because the conditioned DEM never rises
+      as you move downslope. There is nothing to clip and no negative
+      tolerance to invent.
+
+WHY THE PREVIOUS METHOD WAS WITHDRAWN (run 57, kept as a warning)
+  Runs 55-57 measured height above the nearest MAPPED watercourse (OSM rivers
+  plus waterbodies) using a Euclidean nearest-neighbour search. It failed in
+  two ways that no amount of threshold tuning could reach:
+
+    - NEAREST IS NOT DOWNSTREAM. A straight-line search has no guarantee the
+      river it finds is the one a cell drains to; it will happily measure you
+      against a river across a ridge. Garissa, which sits on the Tana and
+      floods repeatedly, came out "Low". Under-warning is the one failure mode
+      this layer must not have, and the method produced it structurally.
+    - MAPPED IS NOT PHYSICAL. OSM maps the Chalbi salt pan as a waterbody, so
+      it entered the drainage network, HAND collapsed to zero across the pan,
+      and an arid plain was classified "Very high".
+
+  The top class covered 12.39% of Kenya, 124,000 km2, an area larger than
+  Malawi. Flow routing addresses all three at the root: channels come from the
+  terrain, not from a map's coverage, and the downslope walk cannot cross a
+  divide.
+
+THE SECOND FAILURE, AND THE ONE THAT MATTERS MOST (run 59)
+  Flow routing alone made things WORSE: 29.2% of Kenya in the top class, up
+  from 12.4%. The guard stopped it. The cause is a step that is correct for
+  routing and wrong for measurement.
+
+  fill_depressions raises every closed basin to its spill level, because water
+  has to be able to leave a basin for flow direction to be defined anywhere
+  inside it. That is necessary. But it means the floor of every closed basin
+  becomes a DEAD-FLAT LID at spill elevation, and pysheds then draws a channel
+  across that lid to carry the water out. Measure height above that channel
+  and you get zero across the entire basin.
+
+  Kenya is full of closed basins: the Chalbi, the Lorian swamp, the northern
+  rift pans, Amboseli. So the very places run 57 got wrong for one reason,
+  run 59 got wrong for another. The lesson is not about HAND, it is that
+  A SURFACE BUILT TO MAKE WATER FLOW IS NOT A SURFACE YOU CAN MEASURE HEIGHTS
+  AGAINST.
+
+  The fix, in two parts, both in step 4:
+    - A channel may not be seeded on filled ground (FILL_TOL_M).
+    - A cell STANDING on filled ground gets no HAND value at all
+      (EXCLUDE_FILLED_CELLS); it falls back to observed water and terrain
+      wetness, which is the right description of a pan anyway: wet when it
+      rains, not a river floodplain.
+
+WHAT THIS COSTS, AND WHAT IT DOES NOT FIX
+  Conditioning the DEM for 117 million cells took 16 minutes in run 59, and
+  flow accumulation 20. None of it depends on the channel threshold, so it is
+  CACHED to _cond/_fdir/_acc_93m.tif and reused. This is not a convenience:
+  at 20 minutes a run you cannot calibrate a threshold honestly, you just take
+  one or two guesses and rationalise whichever looked best.
+
+  We do not reuse etl_16's arrays. Its grid is DEM.width//3 rather than this
+  script's 3 arcsec lattice, and D8 flow direction is a categorical code that
+  cannot be resampled between grids without becoming nonsense.
+
+  Flow routing does NOT fix the DEM. GLO-30 is a surface model, so canopy and
+  buildings sit in it, and in very flat terrain the routing is only as good as
+  the elevation differences it can see. This remains a screening layer.
+
+THE THIRD FAILURE, AND WHY "TWO METRES" WAS NEVER THE RIGHT QUESTION (run 61)
+  This header used to argue that thresholds must be ABSOLUTE, on the grounds
+  that "two metres above the river is dangerous in Turkana and in Kisumu
+  alike". Run 61 and the calibration sweeps showed that sentence is false,
+  and it is false in the way that had been breaking the layer all along.
+
+  Two metres above the TANA is dangerous. Two metres above a 5 km2 ephemeral
+  sand gully is not, because there is no upstream catchment to deliver the
+  water. Absolute HAND cannot tell those apart, so:
+
+    channels at  5 km2: every landmark correct, 21% of Kenya at HAND <= 2 m
+    channels at 30 km2: 10.6% at HAND <= 2 m, but Garissa never above
+                        Moderate, which is the under-warning again
+
+  and no threshold in between fixes both. The knob was never the problem.
+
+  What is absolute is not a number of metres, it is the PHYSICS: flood depth
+  grows with discharge and discharge grows with catchment area. So the layer
+  now judges each cell against a reference flood depth for the channel it
+  actually drains to (see D0_M / A0_KM2 / EXP_B below), plus a minimum
+  catchment before the top class may be used at all. Both are still stated
+  openly for a hydrologist to argue with; they are simply stated as a
+  relationship rather than as a constant.
+
+  The old argument against percentile thresholds still stands, and this is
+  not a percentile threshold: nothing here forces a fixed fraction of Kenya
+  into any class. The share falls out of the terrain.
+
+Licence: JRC Global Surface Water is free with attribution (Pekel et al. 2016,
+Nature 540:418-422). Copernicus DEM attribution as recorded in etl_14.
+
+How to run (from 03_etl with venv active):
+  python etl_24_hazards_flood.py
+============================================================================
+"""
+
+import os
+import sys
+import gc
+import time
+import hashlib
+import contextlib
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+for _k in ("PROJ_LIB", "PROJ_DATA", "GDAL_DATA"):
+    os.environ.pop(_k, None)
+
+import numpy as np
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+# --- NumPy 2.x compatibility shim for pysheds 0.5 -------------------------
+# Same shim as etl_16. pysheds 0.5 predates NumPy 2.0 and still calls names
+# NumPy has since removed (np.in1d and friends). We cannot downgrade NumPy
+# because rasterio needs 2.x, so we restore the old names as aliases. Only
+# fills a name in if it is genuinely missing, so it is safe.
+for _old, _new in [("in1d", "isin"), ("bool8", "bool_"), ("float_", "float64"),
+                   ("int0", "intp"), ("uint0", "uintp"), ("alltrue", "all"),
+                   ("sometrue", "any")]:
+    if not hasattr(np, _old) and hasattr(np, _new):
+        setattr(np, _old, getattr(np, _new))
+# --------------------------------------------------------------------------
+
+try:
+    import rasterio
+    from rasterio.windows import Window
+    from rasterio.vrt import WarpedVRT
+    from rasterio.enums import Resampling
+    from rasterio.features import rasterize
+    from rasterio.shutil import copy as rio_copy
+except ImportError as e:
+    sys.exit(f"ERROR: missing dependency ({e}). With venv active: "
+             f"pip install rasterio")
+
+try:
+    import geopandas as gpd
+except ImportError:
+    sys.exit("ERROR: geopandas missing. With venv active: pip install geopandas")
+
+try:
+    from pysheds.grid import Grid
+except ImportError:
+    sys.exit("ERROR: pysheds is not installed. With the venv active run:\n"
+             "    pip install pysheds\n"
+             "then run this script again. (etl_16 uses it too.)")
+
+BASE = Path(__file__).resolve().parent
+PROJECT = BASE.parent
+PIPELINE = "etl_24_hazards_flood"
+
+RAW_DIR = BASE / "data" / "raw" / "hazards"
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+COG_DIR = PROJECT / "06_rasters" / "cog" / "hazards"
+COG_DIR.mkdir(parents=True, exist_ok=True)
+TERRAIN = PROJECT / "06_rasters" / "cog" / "terrain"
+
+DEM = TERRAIN / "terrain_dem_copernicus_glo30_2021.tif"
+SLOPE = TERRAIN / "terrain_slope_derived_glo30_2021.tif"
+TWI = TERRAIN / "terrain_twi_derived_glo30_90m.tif"
+
+COG_NAME = "hazards_flood_modelled_93m_2025.tif"
+COG_PATH = COG_DIR / COG_NAME
+TMP = RAW_DIR / "_flood_tmp.tif"
+HCLS_TMP = RAW_DIR / "_hand_class_93m.tif"   # HAND-derived class, pre-JRC
+HAND_OUT = RAW_DIR / "hand_93m.tif"      # kept: useful on its own
+
+# CONDITIONING IS CACHED, AND THAT IS A CALIBRATION DECISION, NOT A TWEAK.
+# Run 59 spent 977s filling depressions and 1219s reaching flow accumulation.
+# At 20 minutes a go you cannot honestly calibrate CHANNEL_MIN_KM2: you get
+# one or two guesses and then start rationalising whichever came out nearest.
+# None of that work depends on the channel threshold, so it is written once
+# and reused. Delete these files (or set USE_CACHE = False) to force a rebuild
+# after any change to the DEM or the working grid.
+DEM_WORK = RAW_DIR / "_dem_work_93m.tif"    # working-grid DEM (also the cache)
+COND_CACHE = RAW_DIR / "_cond_93m.tif"      # conditioned DEM
+FDIR_CACHE = RAW_DIR / "_fdir_93m.tif"      # D8 flow direction
+ACC_CACHE = RAW_DIR / "_acc_93m.tif"        # flow accumulation
+USE_CACHE = True
+
+PAD_DEG = 0.02
+WORK_DEG = 3.0 / 3600.0        # 3 arcsec ~ 93 m, exactly 3x the DEM grid
+NODATA = 0                     # classes are 1..5, so 0 is free for nodata
+DEM_NODATA = -9999.0           # explicit nodata so pysheds masks ocean/edges
+
+# JRC Global Surface Water, 10x10 degree tiles named by their NW corner.
+JRC_BASE = "https://storage.googleapis.com/global-surface-water/downloads2021"
+JRC_PATTERNS = [
+    JRC_BASE + "/occurrence/occurrence_{x}_{y}v1_4_2021.tif",
+    "https://storage.googleapis.com/global-surface-water/downloads2020"
+    "/occurrence/occurrence_{x}_{y}v1_3_2020.tif",
+]
+JRC_TILES = [("30E", "10N"), ("40E", "10N"), ("30E", "0N"), ("40E", "0N")]
+
+# ---------------------------------------------------------------------------
+# THE RULES. All absolute, all arguable, all written down.
+# ---------------------------------------------------------------------------
+# CHANNEL INITIATION THRESHOLD. A cell is part of the channel network once
+# this much land drains through it. This is the single most important number
+# in the script: it sets how dense the channel network is, and therefore how
+# much of Kenya is close to a channel at all.
+#
+# The literature puts channel initiation somewhere between 0.5 and 10 km2
+# depending on climate and terrain; drier country needs a LARGER threshold
+# because runoff is flashier and rills are not perennial channels. 5 km2 is a
+# deliberately conservative starting point for Kenya. Raising it thins the
+# network and lowers the top class; lowering it does the reverse.
+#
+# Note what changed conceptually: run 57's equivalent knob was "which OSM tags
+# count as drainage", which is a question about map coverage. This is a
+# question about hydrology, and it can be argued with on those terms.
+CHANNEL_MIN_KM2 = 5.0
+
+# FILLED TERRAIN IS INVENTED TERRAIN, AND CHANNELS MAY NOT BE SEEDED ON IT.
+# This is the correction that run 59 forced. fill_depressions raises every
+# closed basin to its spill level, which is exactly right for ROUTING (water
+# must be able to leave) and completely wrong as a SURFACE to measure heights
+# against. Kenya is full of closed basins: the Chalbi, the Lorian swamp, the
+# northern rift pans, Amboseli. Fill one and its floor becomes a dead-flat
+# plateau at spill elevation; every cell on it then reads HAND = 0 against a
+# channel that pysheds drew across the pan to get the water out.
+#
+# So a cell only counts as a channel if the DEM did not have to be invented
+# there. A cell whose conditioned elevation is more than this far above its
+# measured elevation sits on fill, not on ground.
+FILL_TOL_M = 3.0
+# Whether cells STANDING on fill may receive a HAND value at all. Their height
+# is measured against a surface that is not real, so the default is no, and
+# the classifier falls back to observed water (JRC) and terrain wetness, which
+# is the correct answer for a pan: wet when it rains, not a river floodplain.
+EXCLUDE_FILLED_CELLS = True
+
+# Pointer-jumping doubles the distance walked each pass, so 32 passes covers
+# flow paths up to 4 billion cells. It exits as soon as nothing changes; this
+# is only a guard against an infinite loop if the DEM conditioning left a
+# cycle.
+MAX_JUMP_PASSES = 32
+
+# ---------------------------------------------------------------------------
+# HAZARD IS HAND MEASURED AGAINST THE SIZE OF THE RIVER, NOT IN BARE METRES.
+# ---------------------------------------------------------------------------
+# Runs 55-61 classified on absolute HAND, and calibrate_channel_threshold.py
+# proved that cannot work. On the worst-case-within-1-km reading the layer
+# actually uses:
+#     5 km2 channels : every landmark right, 21% of Kenya at HAND <= 2 m
+#     30 km2 channels: 10.6% of Kenya at HAND <= 2 m, Garissa never above
+#                      Moderate
+# and nothing in between fixes both. The reason is that absolute HAND treats
+# the Tana at Garissa and a 5 km2 sand gully in Turkana as the same object.
+#
+# Flood depth grows with discharge, and discharge grows with contributing
+# area. So each cell is judged against a REFERENCE FLOOD DEPTH for the
+# channel it actually drains to:
+#
+#     d(A) = D0_M * (A / A0_KM2) ** EXP_B          A = outlet catchment, km2
+#     hr   = HAND / d(A)                           hazard follows hr
+#
+# With D0_M = 1.5 m at A0 = 1000 km2 and EXP_B = 0.3:
+#     A =      5 km2 -> d = 0.30 m   (a gully: 1 m above it is not a flood)
+#     A =    500 km2 -> d = 1.22 m
+#     A = 50,000 km2 -> d = 4.86 m   (the Tana: 4 m above it certainly is)
+#
+# EXP_B = 0.3 is from the general depth-area literature, NOT fitted to Kenyan
+# gauge records. It is a defensible starting exponent and an honest candidate
+# for revision the moment gauge data exists. Say so in any report.
+D0_M = 1.5
+A0_KM2 = 1000.0
+EXP_B = 0.3
+# hr thresholds, as multiples of D0_M. Highest matching class wins.
+HR_MULT = {5: 1.0, 4: 2.0, 3: 4.0, 2: 10.0}
+
+# AND A SIZE FLOOR, BECAUSE DIVISION CANNOT DISCRIMINATE AT ZERO.
+# 9.4% of Kenya sits within 1 cm of its channel's elevation: flats, not
+# floodplains. For those cells hr is ~0 whatever the catchment, so scaling
+# alone put 13.8% of the country in the top class. Being level with a 5 km2
+# sand gully is a drainage fact, not a flood hazard: there is no upstream
+# catchment to deliver the water.
+#
+# 10 km2 is the SMALLEST floor that holds the top class under 10% (8.66%)
+# while keeping Garissa on the Tana at Very high. Every larger floor tested
+# (15, 20, 25, 30 km2) demotes Garissa to High, and 100 km2 and above demote
+# it to Moderate or Low, which is run 57's under-warning in a new costume.
+# The class shares at 10 km2 are not a tidy pyramid; that was a heuristic of
+# mine and it loses to a named under-warning.
+AMIN_TOP_KM2 = 10.0
+# Lower classes make smaller claims, so they carry proportionally smaller
+# floors. Low and Very low claim nothing and carry none.
+AMIN_FRAC = {5: 1.0, 4: 1.0 / 3.0, 3: 0.1, 2: 0.0}
+JRC_PERMANENT = 50       # % of 1984-2021 observed as water
+JRC_FREQUENT = 25
+JRC_OCCASIONAL = 5
+TWI_WET = 15.0           # TWI above this is a wet hollow
+SLOPE_FLAT = 2.0         # degrees
+
+# CLASS 6 IS NOT A HAZARD LEVEL, IT IS A LAND-COVER FACT.
+# Run 62 put 10.69% of Kenya in "Very high", but roughly 2 points of that
+# was Lake Turkana and the Kenyan part of Victoria arriving through the JRC
+# permanent-water rule. A lake surface is not a flood hazard: nobody is
+# buying the lake bed, and folding it into the top class inflates the
+# headline number with something that is not a flood.
+#
+# So permanently-inundated cells get their own value. It sits above 5 in the
+# raster because it overrides every hazard judgement -- if the water is
+# always there, height above drainage is not the question -- but any
+# buyer-facing scale must present it as WATER, never as "beyond very high".
+CLASS_NAMES = {1: "Very low", 2: "Low", 3: "Moderate", 4: "High",
+               5: "Very high", 6: "Permanent water"}
+N_CLASSES = 6
+
+ATTRIB = ("Modelled by Geocode Spatial Solutions Ltd from Copernicus GLO-30 "
+          "DEM, derived TWI and slope, OSM watercourses, and JRC Global "
+          "Surface Water (Pekel et al. 2016, Nature 540:418-422).")
+
+SPOTS = [
+    ("Budalangi, Nzoia",   34.150,  0.150, "chronically flooded, expect high"),
+    ("Kano plains",        34.950, -0.200, "flood-prone, expect high"),
+    ("Tana delta",         40.300, -2.500, "delta, expect high"),
+    ("Garissa on the Tana", 39.650, -0.450, "riverine flooding, expect high"),
+    ("Nairobi Karen",      36.700, -1.330, "upland suburb, expect low"),
+    ("Chalbi desert",      37.300,  3.150, "arid plain, expect low"),
+    ("Aberdares slopes",   36.700, -0.450, "steep, expect very low"),
+]
+
+
+def md5_of(path, chunk=8 * 1024 * 1024):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(chunk), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def head_ok(url, timeout=45):
+    try:
+        req = urllib.request.Request(url, method="HEAD",
+                                     headers={"User-Agent": "LIP-ETL/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def download(url, dest, retries=5, timeout=600):
+    part = dest.with_suffix(dest.suffix + ".part")
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "LIP-ETL/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r, \
+                    open(part, "wb") as f:
+                while True:
+                    c = r.read(1 << 20)
+                    if not c:
+                        break
+                    f.write(c)
+            part.replace(dest)
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 404):
+                part.unlink(missing_ok=True)
+                return False
+        except (urllib.error.URLError, TimeoutError, OSError):
+            pass
+        part.unlink(missing_ok=True)
+        time.sleep(3 * attempt)
+    return False
+
+
+def read_onto(path, transform, width, height, resampling, scale=1.0):
+    """Read any raster onto our working grid. Returns float32."""
+    with rasterio.open(path) as src:
+        with WarpedVRT(src, crs="EPSG:4326", transform=transform,
+                       width=width, height=height,
+                       resampling=resampling) as v:
+            a = v.read(1).astype("float32")
+            nd = src.nodata
+    if nd is not None:
+        a[a == nd] = np.nan
+    if scale != 1.0:
+        a *= scale
+    return a
+
+
+load_dotenv(BASE / ".env")
+pw = os.getenv("DB_PASSWORD")
+if not pw or pw == "put_your_password_here":
+    sys.exit("ERROR: edit the .env file and set DB_PASSWORD first.")
+
+db_url = (f"postgresql+psycopg2://{os.getenv('DB_USER','postgres')}:{pw}"
+          f"@{os.getenv('DB_HOST','localhost')}:{os.getenv('DB_PORT','5432')}"
+          f"/{os.getenv('DB_NAME','land_intelligence_kenya')}")
+engine = create_engine(db_url)
+with engine.connect() as conn:
+    conn.execute(text("SELECT 1"))
+print("Connected to database:", os.getenv("DB_NAME", "land_intelligence_kenya"))
+
+with engine.begin() as conn:
+    run_id = conn.execute(text("""
+        INSERT INTO metadata.etl_runs (pipeline, started_at, run_status)
+        VALUES (:p, now(), 'running') RETURNING run_id
+    """), {"p": PIPELINE}).scalar()
+print(f"ETL run opened (run_id={run_id})")
+
+try:
+    for p in (DEM, SLOPE, TWI):
+        if not p.exists():
+            raise SystemExit(f"Missing input raster: {p}")
+
+    with engine.connect() as conn:
+        xmin, xmax, ymin, ymax = conn.execute(text("""
+            SELECT ST_XMin(e), ST_XMax(e), ST_YMin(e), ST_YMax(e)
+            FROM (SELECT ST_Extent(geom) AS e FROM admin.country) t
+        """)).one()
+        dataset_id = conn.execute(text(
+            "SELECT dataset_id FROM metadata.datasets "
+            "WHERE code = 'hazards.flood'")).scalar()
+        source_id = conn.execute(text(
+            "SELECT source_id FROM metadata.sources "
+            "WHERE name IN ('Geocode Spatial Solutions','JRC Global Surface "
+            "Water') ORDER BY name LIMIT 1")).scalar()
+    if dataset_id is None:
+        raise SystemExit("hazards.flood dataset missing. Run etl_04 first.")
+    if source_id is None:
+        raise SystemExit("No suitable source row found. Expected 'Geocode "
+                         "Spatial Solutions' in metadata.sources.")
+
+    xmin, xmax = float(xmin) - PAD_DEG, float(xmax) + PAD_DEG
+    ymin, ymax = float(ymin) - PAD_DEG, float(ymax) + PAD_DEG
+
+    # Snap the working grid to the DEM's own 1 arcsec lattice so no sub-pixel
+    # shift creeps in between elevation, slope and TWI.
+    x0 = np.floor(xmin / WORK_DEG) * WORK_DEG
+    y1 = np.ceil(ymax / WORK_DEG) * WORK_DEG
+    W = int(round((np.ceil(xmax / WORK_DEG) * WORK_DEG - x0) / WORK_DEG))
+    H = int(round((y1 - np.floor(ymin / WORK_DEG) * WORK_DEG) / WORK_DEG))
+    transform = rasterio.Affine(WORK_DEG, 0, x0, 0, -WORK_DEG, y1)
+    print(f"Working grid: {W:,} x {H:,} px at ~{WORK_DEG*111320:.0f} m "
+          f"({W*H/1e6:.0f} million cells)")
+
+    # -----------------------------------------------------------------------
+    # 1. JRC Global Surface Water: the only OBSERVED input
+    # -----------------------------------------------------------------------
+    print("\n1. JRC Global Surface Water occurrence (observed 1984-2021)")
+    pattern = None
+    for p in JRC_PATTERNS:
+        test = p.format(x=JRC_TILES[0][0], y=JRC_TILES[0][1])
+        ok = head_ok(test)
+        print(f"   {'OK  ' if ok else 'no  '} {test}")
+        if ok:
+            pattern = p
+            break
+    jrc_files = []
+    if pattern is None:
+        print("   WARNING: no JRC pattern responded. Continuing WITHOUT the")
+        print("   observed-water input. The layer will be entirely modelled,")
+        print("   which is weaker: say so in the catalogue note.")
+    else:
+        for x, y in JRC_TILES:
+            url = pattern.format(x=x, y=y)
+            dest = RAW_DIR / Path(url).name
+            if dest.exists() and dest.stat().st_size > 1_000_000:
+                print(f"   have {dest.name} ({dest.stat().st_size/1e6:.0f} MB)")
+                jrc_files.append(dest)
+                continue
+            print(f"   downloading {dest.name} ...", flush=True)
+            if download(url, dest):
+                print(f"     done ({dest.stat().st_size/1e6:.0f} MB)")
+                jrc_files.append(dest)
+            else:
+                print(f"     not available, skipping")
+
+    # -----------------------------------------------------------------------
+    # 2. Elevation on the working grid
+    # -----------------------------------------------------------------------
+    print("\n2. Reading elevation onto the working grid ...")
+    elev = read_onto(DEM, transform, W, H, Resampling.average)
+    print(f"   elevation: min {np.nanmin(elev):.0f} m, "
+          f"max {np.nanmax(elev):.0f} m")
+
+    # -----------------------------------------------------------------------
+    # 3. Drainage network from PostGIS -> mask
+    # -----------------------------------------------------------------------
+    print("\n3. Rasterising OSM rivers (FOR VALIDATION ONLY, not for HAND) ...")
+    # THE ROLE OF OSM HAS CHANGED. Runs 55-57 built the drainage network from
+    # these features, which made HAND a function of how well Kenya happens to
+    # be mapped. The channel network now comes from the terrain (step 4), so
+    # OSM is demoted to what it is genuinely good for: an independent check
+    # that our derived channels land on real rivers.
+    #
+    # WATERBODIES ARE DELIBERATELY EXCLUDED. OSM maps the Chalbi salt pan as a
+    # waterbody. In run 57 that seeded the drainage network, HAND went to zero
+    # across the pan, and a desert was classified Very high. Standing water is
+    # not a channel; where it is genuinely permanent, flow accumulation finds
+    # it anyway because everything upstream drains into it.
+    rivers = gpd.read_postgis(
+        "SELECT geom FROM environment.rivers "
+        "WHERE status='active' AND waterway_type = 'river'",
+        engine, geom_col="geom")
+    print(f"   {len(rivers):,} OSM rivers loaded for cross-checking")
+    if len(rivers) == 0:
+        raise SystemExit(
+            "No features with waterway_type='river'. Check that schema v1.2 "
+            "was applied and etl_03 populated waterway_type.")
+
+    osm_river = rasterize(((g, 1) for g in rivers.geometry if g is not None),
+                          out_shape=(H, W), transform=transform,
+                          fill=0, dtype="uint8", all_touched=True).astype(bool)
+    print(f"   OSM river cells: {int(osm_river.sum()):,} "
+          f"({100.0*osm_river.sum()/(W*H):.2f}% of the grid)")
+    del rivers
+
+    # -----------------------------------------------------------------------
+    # 3b. THE COUNTRY MASK. Everything below reports "% of Kenya", and until
+    # run 75 that was false: the class areas summed to 1,002,267 km2 against
+    # Kenya's 580,367, so 42% of what we classified was Indian Ocean,
+    # Ugandan and Tanzanian Lake Victoria, and neighbouring land inside the
+    # padded bbox. GLO-30 gives the ocean an elevation of 0 rather than
+    # nodata, so it passed the "is there land here" test.
+    #
+    # This is lesson 17 from session 5 -- clip to the country before
+    # comparing against country figures -- recurring for the third time. It
+    # never changed a per-parcel value, but it diluted every national share
+    # and therefore the denominator the top-class guard is judged against.
+    # -----------------------------------------------------------------------
+    print("\n3b. Rasterising the national boundary (clip for all statistics)")
+    country = gpd.read_postgis(
+        "SELECT geom FROM admin.country", engine, geom_col="geom")
+    if country.empty:
+        raise SystemExit("admin.country is empty; cannot clip to Kenya.")
+    in_kenya = rasterize(((g, 1) for g in country.geometry if g is not None),
+                         out_shape=(H, W), transform=transform, fill=0,
+                         dtype="uint8", all_touched=False).astype(bool)
+    del country
+    kenya_cells = int(in_kenya.sum())
+    cell_km2_pre = (WORK_DEG * 111320) * (WORK_DEG * 110574) / 1e6
+    print(f"   inside Kenya: {kenya_cells:,} cells "
+          f"({kenya_cells*cell_km2_pre:,.0f} km2, "
+          f"{100.0*kenya_cells/(W*H):.1f}% of the working grid)")
+    print(f"   Kenya's official land area is ~580,367 km2; a large "
+          f"discrepancy here means the boundary or the grid is wrong.")
+
+    # -----------------------------------------------------------------------
+    # 4. HAND
+    # -----------------------------------------------------------------------
+    print("\n4. Computing HAND by flow routing ...")
+    t0 = time.time()
+    # valid = where the DEM has data, used for COMPUTATION. Flow routing must
+    # see beyond the border, because water crosses it.
+    valid = np.isfinite(elev)
+    # n_valid = the denominator for REPORTING, which must be Kenya alone.
+    # These were the same number until run 75, and that is why every
+    # "% of Kenya" in this script was really "% of the bounding box".
+    n_valid = int((valid & in_kenya).sum())
+    print(f"   reporting denominator: {n_valid:,} cells inside Kenya "
+          f"(computation still uses the full grid)")
+
+    # 4a. Hand the working-grid elevation to pysheds. It wants a file, and a
+    #     file also means the conditioning is reproducible outside this script.
+    dprof = {"driver": "GTiff", "dtype": "float32", "count": 1,
+             "crs": "EPSG:4326", "transform": transform, "width": W,
+             "height": H, "nodata": DEM_NODATA, "tiled": True,
+             "blockxsize": 512, "blockysize": 512, "bigtiff": "YES"}
+    # np.float32 on the fill value is deliberate: a bare Python float would
+    # promote the whole 117-million-cell result to float64 and briefly cost an
+    # extra ~900 MB for nothing.
+    def cache_ok(p):
+        if not (USE_CACHE and p.exists()):
+            return False
+        try:
+            with rasterio.open(p) as s:
+                return (s.width == W and s.height == H
+                        and np.allclose(np.array(s.transform)[:6],
+                                        np.array(transform)[:6], atol=1e-12))
+        except Exception:
+            return False
+
+    def write_cache(p, arr, dtype, nodata):
+        pr = dict(dprof)
+        pr.update(dtype=dtype, nodata=nodata, compress="DEFLATE")
+        with rasterio.open(p, "w", **pr) as d:
+            d.write(arr.astype(dtype), 1)
+
+    if not cache_ok(DEM_WORK):
+        with rasterio.open(DEM_WORK, "w", **dprof) as d:
+            d.write(np.where(valid, elev, np.float32(DEM_NODATA)), 1)
+    del elev
+    gc.collect()
+
+    caches = (COND_CACHE, FDIR_CACHE, ACC_CACHE)
+    if all(cache_ok(p) for p in caches):
+        print("   reusing cached conditioning and flow routing "
+              "(delete _cond/_fdir/_acc_93m.tif to force a rebuild) ...",
+              flush=True)
+        with rasterio.open(COND_CACHE) as s:
+            cond = s.read(1).astype("float32")
+        with rasterio.open(FDIR_CACHE) as s:
+            fdir_arr = s.read(1).astype("int16")
+        with rasterio.open(ACC_CACHE) as s:
+            acc_arr = s.read(1).astype("float32")
+        print(f"   cache loaded in {time.time()-t0:.0f}s.")
+    else:
+        print("   conditioning the DEM (fill pits, fill depressions, "
+              "resolve flats). This took ~16 min in run 59 and is cached "
+              "afterwards ...", flush=True)
+        grid = Grid.from_raster(str(DEM_WORK))
+        dem_r = grid.read_raster(str(DEM_WORK))
+        pit_filled = grid.fill_pits(dem_r)
+        flooded = grid.fill_depressions(pit_filled)
+        inflated = grid.resolve_flats(flooded)
+        print(f"   conditioned in {time.time()-t0:.0f}s. Flow direction and "
+              f"accumulation ...", flush=True)
+        fdir = grid.flowdir(inflated)
+        acc = grid.accumulation(fdir)
+
+        # Pull out float32/int32 copies and release every pysheds object
+        # before doing anything else. pysheds works in float64, so holding its
+        # arrays alongside ours is what would blow the memory budget.
+        cond = np.asarray(inflated, dtype="float32")
+        fdir_arr = np.asarray(fdir, dtype="int16")
+        acc_arr = np.asarray(acc, dtype="float32")
+        del grid, dem_r, pit_filled, flooded, inflated, fdir, acc
+        gc.collect()
+        print(f"   flow routing done in {time.time()-t0:.0f}s. Caching ...",
+              flush=True)
+        write_cache(COND_CACHE, cond, "float32", DEM_NODATA)
+        write_cache(FDIR_CACHE, fdir_arr, "int16", 0)
+        write_cache(ACC_CACHE, acc_arr, "float32", -1.0)
+
+    # 4b. HOW MUCH OF THE DEM DID WE INVENT? This is the number run 59 needed
+    #     and did not print. fill_depth is how far conditioning had to raise
+    #     each cell; anywhere it is large, the "terrain" is a flat lid over a
+    #     closed basin and no height measured against it means anything.
+    with rasterio.open(DEM_WORK) as s:
+        orig = s.read(1).astype("float32")
+    np.subtract(cond, orig, out=orig)        # orig now holds fill depth
+    filled = (orig > FILL_TOL_M) & valid
+    fill_pct = 100.0 * float((filled & in_kenya).sum()) / max(1, n_valid)
+    deep = float(np.percentile(orig[filled], 90)) if filled.any() else 0.0
+    del orig
+    gc.collect()
+    print(f"   DEM raised by conditioning on {fill_pct:.1f}% of Kenya "
+          f"(90th pct of that fill: {deep:.1f} m)")
+
+    # 4c. Channels: enough land drains through, AND the ground is real.
+    cell_km2 = (WORK_DEG * 111320) * (WORK_DEG * 110574) / 1e6
+    chan_cells = CHANNEL_MIN_KM2 / cell_km2
+    # acc_arr is kept alive past this point: the classification needs the
+    # catchment area of each cell's OUTLET, not just whether it is a channel.
+    big = (acc_arr >= chan_cells) & valid
+    n_big = int((big & in_kenya).sum())
+    channels = big & ~filled
+    del big
+    gc.collect()
+    n_chan = int((channels & in_kenya).sum())
+    print(f"   channel threshold: {CHANNEL_MIN_KM2:.1f} km2 "
+          f"= {chan_cells:,.0f} cells")
+    print(f"   cells over threshold      : {n_big:,} "
+          f"({100.0*n_big/max(1, n_valid):.2f}% of Kenya)")
+    print(f"   after dropping filled land: {n_chan:,} "
+          f"({100.0*n_chan/max(1, n_valid):.2f}% of Kenya)  <- the network")
+    if n_chan == 0:
+        raise SystemExit("No channels derived. CHANNEL_MIN_KM2 is too high, "
+                         "or FILL_TOL_M is too strict.")
+
+    # Cross-check against OSM before trusting the network. This is the check
+    # run 57 could not perform, because OSM WAS the network.
+    osm_v = osm_river & valid
+    if osm_v.any():
+        hit = float((channels & osm_v).sum()) / float(osm_v.sum())
+        # Also allow a one-cell offset, because a bank line digitised by hand
+        # and a thalweg found by routing are not expected to land on the same
+        # 93 m pixel. Exact agreement understates the match.
+        near = channels.copy()
+        near[1:, :] |= channels[:-1, :]
+        near[:-1, :] |= channels[1:, :]
+        near[:, 1:] |= channels[:, :-1]
+        near[:, :-1] |= channels[:, 1:]
+        hit1 = float((near & osm_v).sum()) / float(osm_v.sum())
+        del near
+        print(f"   OSM river cells matched by a derived channel: "
+              f"{100.0*hit:.1f}% exact, {100.0*hit1:.1f}% within one cell")
+    del osm_v, osm_river
+    gc.collect()
+
+    # 4d. Walk downslope to the channel each cell actually drains into.
+    #
+    #     Done by POINTER JUMPING rather than a per-cell loop: 117 million
+    #     Python-level walks is not a thing that finishes. We build one array
+    #     'nxt' holding each cell's downstream neighbour, make channel cells
+    #     point at themselves, then repeatedly do nxt = nxt[nxt]. Each pass
+    #     DOUBLES the distance walked, so ~20 passes covers any flow path in
+    #     Kenya, and channel self-loops absorb the walk on arrival.
+    print("   walking each cell downslope to its own channel ...", flush=True)
+    N = H * W
+    # pysheds' default dirmap, clockwise from north.
+    DIRMAP = {64: (-1, 0), 128: (-1, 1), 1: (0, 1), 2: (1, 1),
+              4: (1, 0), 8: (1, -1), 16: (0, -1), 32: (-1, -1)}
+
+    nxt = np.arange(N, dtype="int32").reshape(H, W)
+    base = nxt.copy()                       # source flat index of every cell
+    # Only interior cells get a downstream neighbour. Border cells stay
+    # pointing at themselves, which makes flowing off the edge a terminal
+    # state rather than an out-of-bounds index. The border is 4 cells in
+    # 10,000, so nothing meaningful is lost.
+    f_in = fdir_arr[1:-1, 1:-1]
+    b_in = base[1:-1, 1:-1]
+    n_in = nxt[1:-1, 1:-1]
+    for code, (dr, dc) in DIRMAP.items():
+        m = (f_in == code)
+        if m.any():
+            n_in[m] = b_in[m] + dr * W + dc
+    del f_in, b_in, n_in, base, fdir_arr
+    gc.collect()
+
+    nxt = nxt.ravel()
+    ch_flat = channels.ravel()
+    nxt[ch_flat] = np.flatnonzero(ch_flat)   # a channel is its own outlet
+    nxt[~valid.ravel()] = np.flatnonzero(~valid.ravel())   # so is nodata
+
+    for p in range(MAX_JUMP_PASSES):
+        nxt2 = nxt[nxt]
+        done = np.array_equal(nxt2, nxt)
+        nxt = nxt2
+        del nxt2
+        if done:
+            print(f"   downslope walk converged after {p+1} passes.")
+            break
+    else:
+        print(f"   WARNING: walk did not converge in {MAX_JUMP_PASSES} passes.")
+
+    # 4e. HAND = my elevation minus the elevation of the channel I drain to.
+    #     Non-negative by construction: the conditioned DEM never rises as you
+    #     move downslope, so the outlet is never above its own catchment.
+    cflat = cond.ravel()
+    resolved = ch_flat[nxt]                  # did the walk reach a channel?
+    hand = (cflat - cflat[nxt]).reshape(H, W)
+    del cflat, cond, ch_flat
+    gc.collect()
+
+    # HOW BIG IS THE CHANNEL EACH CELL DRAINS TO? This is the number the whole
+    # rebuild turns on, and it costs one gather: the accumulated area at the
+    # cell the downslope walk terminated on.
+    oacc = acc_arr.ravel()[nxt].reshape(H, W)
+    oacc *= np.float32(cell_km2)             # cells -> km2
+    del acc_arr
+    gc.collect()
+
+    hand_ok = resolved.reshape(H, W) & valid
+    del resolved, nxt
+    gc.collect()
+
+    hand[channels] = 0.0
+    hand_ok |= channels
+    hand_ok &= valid
+    del channels
+    gc.collect()
+
+    # Any residual negative is float32 rounding on the conditioned surface,
+    # not a divide crossing, so clipping it is honest here in a way it was not
+    # in run 56.
+    # Counted without materialising hand[hand_ok], which would be a ~400 MB
+    # temporary just to answer a yes/no question.
+    neg = int(np.count_nonzero((hand < -0.01) & hand_ok))
+    if neg:
+        print(f"   note: {neg:,} cells fractionally negative "
+              f"(float32 rounding), clipped.")
+    np.clip(hand, 0, 32000, out=hand)
+
+    # WHERE IS THE LOW TAIL COMING FROM? Run 59 put 24.3% of Kenya at HAND
+    # <= 2 m and gave no way to tell whether that was floodplain or fill. It
+    # is the difference between a threshold to tune and a surface to distrust,
+    # so it gets measured rather than assumed.
+    # 2 m here is a fixed yardstick for the diagnostic only. It is no longer
+    # a classification threshold: severity is decided by hr and the catchment
+    # floor further down. Kept because it is the number runs 55-61 were all
+    # judged on, so it stays comparable across the whole history.
+    LOW_TAIL_REF_M = 2.0
+    low = (hand <= LOW_TAIL_REF_M) & hand_ok
+    n_low = int((low & in_kenya).sum())
+    if n_low:
+        on_fill = 100.0 * float((low & filled).sum()) / n_low
+        print(f"   of cells at HAND <= {LOW_TAIL_REF_M:.0f} m, "
+              f"{on_fill:.1f}% stand on filled (invented) terrain")
+        print(f"   (that tail is {100.0*n_low/max(1, n_valid):.2f}% of Kenya; "
+              f"it is NO LONGER the top class, see 4f)")
+    del low
+    gc.collect()
+
+    if EXCLUDE_FILLED_CELLS:
+        before = float(hand_ok.sum())
+        hand_ok &= ~filled
+        print(f"   dropping HAND on filled terrain: "
+              f"{100.0*(before-hand_ok.sum())/max(1.0, before):.1f}% of "
+              f"defined cells withdrawn (they fall back to JRC and TWI)")
+    del filled
+    gc.collect()
+    print(f"   HAND is defined for "
+          f"{100.0*float((hand_ok & in_kenya).sum())/max(1, n_valid):.1f}% "
+          f"of Kenya (the rest drains off-grid or stands on fill)")
+    # PRINT THE DISTRIBUTION BEFORE JUDGING ANYTHING. Run 55 reported only the
+    # median and the 95th percentile, which hid the fact that 40% of cells sat
+    # under 2 m. Showing the low tail is what makes a bad drainage definition
+    # visible immediately rather than five steps later.
+    hv = hand[hand_ok]
+    ps = [1, 5, 10, 25, 50, 75, 90, 95, 99]
+    qs = np.percentile(hv, ps) if hv.size else np.zeros(len(ps))
+    print("   (distribution over cells where HAND is DEFINED only)")
+    print(f"   HAND computed in {time.time()-t0:.0f}s.")
+    print("   percentile  " + "".join(f"{p:>8}%" for p in ps))
+    print("   HAND (m)    " + "".join(f"{q:>9.1f}" for q in qs))
+    del hv
+    gc.collect()
+    print(f"   outlet catchment: median "
+          f"{float(np.median(oacc[hand_ok])):,.0f} km2, 95th pct "
+          f"{float(np.percentile(oacc[hand_ok], 95)):,.0f} km2")
+
+    # ---------------------------------------------------------------- 4f.
+    # Turn HAND into a hazard class using the reference flood depth of the
+    # channel each cell drains to, plus the size floor. Written to disk as a
+    # class raster so step 5 can stream it alongside JRC and TWI.
+    print(f"\n   classifying on hr = HAND / d(A), D0 = {D0_M} m at "
+          f"{A0_KM2:,.0f} km2, B = {EXP_B}, top-class floor "
+          f"{AMIN_TOP_KM2:,.0f} km2")
+    dscale = np.power(np.maximum(oacc / np.float32(A0_KM2),
+                                 np.float32(1e-9)), np.float32(EXP_B))
+    hr = hand / dscale
+    del dscale
+    gc.collect()
+
+    hcls = np.zeros((H, W), dtype="uint8")
+    hcls[hand_ok] = 1
+    for c in (2, 3, 4, 5):
+        floor = AMIN_TOP_KM2 * AMIN_FRAC[c]
+        hcls[hand_ok & (hr <= HR_MULT[c] * D0_M) & (oacc >= floor)] = c
+    del hr, oacc
+    gc.collect()
+
+    print(f"   {'HAND-only class':22}{'share of Kenya':>16}")
+    for c in range(1, 6):
+        print(f"   {CLASS_NAMES[c]:22}"
+              f"{100.0*float(((hcls == c) & in_kenya).sum())/max(1, n_valid):>15.2f}%")
+    print("   (observed water and terrain wetness are added in step 5, so")
+    print("    the final top class will be slightly larger than this.)")
+
+    cprof = {"driver": "GTiff", "dtype": "uint8", "count": 1,
+             "crs": "EPSG:4326", "transform": transform, "width": W,
+             "height": H, "nodata": 0, "tiled": True, "blockxsize": 512,
+             "blockysize": 512, "compress": "DEFLATE", "bigtiff": "YES"}
+    with rasterio.open(HCLS_TMP, "w", **cprof) as d:
+        d.write(hcls, 1)
+    del hcls
+    gc.collect()
+
+    # WRITE HAND NOW AND FREE THE MEMORY.
+    # Flow routing is the one step that genuinely needs the whole grid in RAM.
+    # Everything after it can be done a band at a time, so we get HAND onto
+    # disk and drop it before touching TWI, slope and JRC. Holding all five
+    # layers at once would peak near 3 GB, which is not a reasonable thing to
+    # ask of a working laptop.
+    hprof = {"driver": "GTiff", "dtype": "int16", "count": 1,
+             "crs": "EPSG:4326", "transform": transform, "width": W,
+             "height": H, "nodata": -32768, "tiled": True,
+             "blockxsize": 512, "blockysize": 512,
+             "compress": "DEFLATE", "predictor": 2, "bigtiff": "YES"}
+    # -32768 here means "HAND is not defined at this cell", not "no data about
+    # this cell". The classifier reads it that way.
+    with rasterio.open(HAND_OUT, "w", **hprof) as d:
+        d.write(np.where(hand_ok, np.clip(hand, 0, 32000), -32768
+                         ).astype("int16"), 1)
+    print(f"   HAND saved for reuse: {HAND_OUT.name} "
+          f"({HAND_OUT.stat().st_size/1e6:.0f} MB)")
+    del hand, valid, hand_ok
+    gc.collect()
+    # DEM_WORK, _cond, _fdir and _acc are deliberately KEPT. They are the
+    # conditioning cache; deleting them turns every calibration run back into
+    # a 20-minute run.
+
+    # -----------------------------------------------------------------------
+    # 5. Classify, ONE BAND AT A TIME. Highest matching rule wins.
+    # -----------------------------------------------------------------------
+    print("\n5. Classifying flood hazard, streaming band by band ...")
+    counts = np.zeros(N_CLASSES + 1, dtype="int64")
+    prof = {"driver": "GTiff", "dtype": "uint8", "count": 1,
+            "crs": "EPSG:4326", "transform": transform, "width": W,
+            "height": H, "nodata": NODATA, "tiled": True,
+            "blockxsize": 512, "blockysize": 512,
+            "compress": "DEFLATE", "bigtiff": "YES"}
+    twi_stats, slope_stats, jrc_seen = [], [], 0
+
+    with contextlib.ExitStack() as stack:
+        hsrc = stack.enter_context(rasterio.open(HCLS_TMP))
+        # The DEM defines the DOMAIN: where there is land to classify at all.
+        # HAND's own nodata now means "HAND not meaningful here", which is a
+        # different thing and must not be read as "no data".
+        dsrc = stack.enter_context(rasterio.open(DEM))
+        dvrt = stack.enter_context(
+            WarpedVRT(dsrc, crs="EPSG:4326", transform=transform,
+                      width=W, height=H, resampling=Resampling.average))
+        dem_nd = dsrc.nodata
+        tsrc = stack.enter_context(rasterio.open(TWI))
+        tvrt = stack.enter_context(
+            WarpedVRT(tsrc, crs="EPSG:4326", transform=transform,
+                      width=W, height=H, resampling=Resampling.bilinear))
+        ssrc = stack.enter_context(rasterio.open(SLOPE))
+        svrt = stack.enter_context(
+            WarpedVRT(ssrc, crs="EPSG:4326", transform=transform,
+                      width=W, height=H, resampling=Resampling.average))
+        jvrts = []
+        for f in jrc_files:
+            js = stack.enter_context(rasterio.open(f))
+            # Resampling.max is deliberate: aggregating 30 m to 93 m for a
+            # HAZARD layer should be precautionary. If ANY 30 m pixel inside
+            # our cell has been under water, the cell inherits that.
+            jvrts.append(stack.enter_context(
+                WarpedVRT(js, crs="EPSG:4326", transform=transform,
+                          width=W, height=H, resampling=Resampling.max)))
+        dst = stack.enter_context(rasterio.open(TMP, "w", **prof))
+
+        BAND = 1024
+        for r in range(0, H, BAND):
+            rh = min(BAND, H - r)
+            win = Window(0, r, W, rh)
+            hcls = hsrc.read(1, window=win)   # 1..5, 0 = HAND not defined
+            dem = dvrt.read(1, window=win).astype("float32")
+            domain = np.isfinite(dem)         # there is land here
+            if dem_nd is not None:
+                domain &= (dem != dem_nd)
+            # ...AND it is inside Kenya. Without this the ocean classifies.
+            domain &= in_kenya[r:r + rh, :]
+            del dem
+
+            twi = tvrt.read(1, window=win).astype("float32") * 0.01
+            slope = svrt.read(1, window=win).astype("float32") * 0.01
+            np.nan_to_num(twi, copy=False, nan=-999.0)
+            np.nan_to_num(slope, copy=False, nan=999.0)
+
+            jrc = np.zeros((rh, W), dtype="float32")
+            for v in jvrts:
+                a = v.read(1, window=win)
+                a = np.where(a == 255, 0, a).astype("float32")
+                np.maximum(jrc, a, out=jrc)
+                del a
+
+            # The HAND class already carries the catchment-scaled judgement.
+            # Observed water and terrain wetness are unioned on top, because
+            # JRC saw the water whether or not the terrain explains it, and
+            # TWI is computed from the terrain itself. Where HAND is
+            # undefined (hcls == 0) those two carry the cell on their own,
+            # which is what happens over the Chalbi and other filled pans.
+            cls = np.zeros((rh, W), dtype="uint8")
+            cls[domain] = 1
+            cls[domain & (hcls >= 2)] = 2
+            cls[domain & ((hcls >= 3) |
+                          (jrc >= JRC_OCCASIONAL) |
+                          ((twi >= TWI_WET) & (slope < SLOPE_FLAT)))] = 3
+            cls[domain & ((hcls >= 4) | (jrc >= JRC_FREQUENT))] = 4
+            # Note JRC_PERMANENT no longer feeds class 5. Water that is there
+            # every year is not land at very high risk of flooding; it is
+            # water, and it gets its own value below.
+            cls[domain & (hcls >= 5)] = 5
+            cls[domain & (jrc >= JRC_PERMANENT)] = 6
+
+            dst.write(cls, 1, window=win)
+            counts += np.bincount(cls.ravel(), minlength=N_CLASSES + 1)
+            if domain.any():
+                twi_stats.append(float(np.median(twi[domain])))
+                slope_stats.append(float(np.median(slope[domain])))
+                jrc_seen += int((jrc > 0).sum())
+            del hcls, domain, twi, slope, jrc, cls
+            if (r // BAND) % 4 == 0:
+                print(f"   band {r//BAND + 1}/{(H + BAND - 1)//BAND}",
+                      flush=True)
+
+    n = int(counts[1:].sum())
+    if twi_stats:
+        print(f"\n   TWI median (of band medians)   : "
+              f"{np.median(twi_stats):.1f}")
+        print(f"   slope median (of band medians) : "
+              f"{np.median(slope_stats):.2f} deg")
+    if jrc_files:
+        print(f"   JRC cells ever seen as water   : "
+              f"{100.0*jrc_seen/(W*H):.2f}%")
+
+    print(f"\n   {'class':16}{'share':>9}{'km2':>12}")
+    for c in range(1, N_CLASSES + 1):
+        print(f"   {CLASS_NAMES[c]:16}{100.0*counts[c]/n:>8.2f}%"
+              f"{counts[c]*cell_km2:>12,.0f}")
+    land = int(counts[1:N_CLASSES].sum())     # excludes permanent water
+    print(f"   {'-- of LAND (excluding permanent water) --':<16}")
+    for c in range(1, N_CLASSES):
+        print(f"   {CLASS_NAMES[c]:16}{100.0*counts[c]/max(1, land):>8.2f}%")
+
+    # THE GUARD MEASURES LAND, NOT WATER. Judging the top class against a
+    # denominator that includes lake surface would let the layer look safer
+    # simply because Kenya has big lakes.
+    vh = 100.0 * counts[5] / max(1, land)
+    if vh > 15.0:
+        raise SystemExit(
+            f"{vh:.1f}% of Kenya classed Very high. That is not credible and "
+            f"would make the layer useless as a warning. Check the drainage "
+            f"rasterisation and the HAND thresholds before cataloguing.")
+
+    # -----------------------------------------------------------------------
+    # 6. COG and catalogue
+    # -----------------------------------------------------------------------
+    print("\n6. Writing the COG ...")
+    if COG_PATH.exists():
+        COG_PATH.unlink()
+    rio_copy(str(TMP), str(COG_PATH), driver="COG", compress="DEFLATE",
+             overview_resampling="nearest", BIGTIFF="YES")
+    TMP.unlink(missing_ok=True)
+    print(f"   COG: {COG_PATH.name} ({COG_PATH.stat().st_size/1e6:.1f} MB)")
+
+    print("\n   Spot checks (majority class within ~1 km):")
+    with rasterio.open(COG_PATH) as s:
+        half = 5
+        for name, lon, lat, note in SPOTS:
+            r, c = s.index(lon, lat)
+            c0, r0 = max(0, c - half), max(0, r - half)
+            blk = s.read(1, window=Window(c0, r0,
+                                          min(2*half+1, s.width - c0),
+                                          min(2*half+1, s.height - r0)))
+            g = blk[blk != NODATA]
+            if g.size == 0:
+                print(f"     {name:22}{'nodata':16}{note}")
+                continue
+            mode = int(np.bincount(g.ravel()).argmax())
+            worst = int(g.max())
+            print(f"     {name:22}{CLASS_NAMES[mode]:10}"
+                  f"(worst nearby: {CLASS_NAMES[worst]:10}) {note}")
+        b = s.bounds
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            DELETE FROM metadata.raster_catalog
+            WHERE dataset_id = :did AND variable = 'flood_hazard'
+        """), {"did": dataset_id})
+        conn.execute(text("""
+            INSERT INTO metadata.raster_catalog
+                (dataset_id, name, variable, storage_url, format, pixel_size_m,
+                 band_count, nodata_value, temporal_start, temporal_end, bbox,
+                 checksum, source_id, source_date, confidence)
+            VALUES
+                (:did, :name, 'flood_hazard', :url, 'COG', :px, 1, :nodata,
+                 DATE '1984-01-01', DATE '2021-12-31',
+                 ST_MakeEnvelope(:l, :b, :r, :t, 4326),
+                 :chk, :sid, CURRENT_DATE, 3)
+        """), {
+            "did": dataset_id,
+            "name": (f"MODELLED flood hazard, 5 classes "
+                     f"(1=Very low ... 5=Very high, 6=PERMANENT WATER which "
+                     f"is a land-cover fact and NOT a hazard level), "
+                     f"0=nodata. Built from HAND "
+                     f"(height above nearest drainage, derived by D8 flow "
+                     f"routing on the conditioned GLO-30 DEM; channels defined "
+                     f"at {CHANNEL_MIN_KM2} km2 accumulated drainage area), "
+                     f"scaled by the size of the channel each cell drains to: "
+                     f"reference flood depth d(A)={D0_M}m*(A/{A0_KM2:.0f})^"
+                     f"{EXP_B}, class from HAND/d(A) at "
+                     f"{HR_MULT[5]}/{HR_MULT[4]}/{HR_MULT[3]}/{HR_MULT[2]} "
+                     f"x {D0_M}, with the top class requiring an outlet "
+                     f"catchment of at least {AMIN_TOP_KM2:.0f} km2. Combined "
+                     f"with TWI>={TWI_WET} on slope<{SLOPE_FLAT}deg, and JRC "
+                     f"observed water occurrence >={JRC_OCCASIONAL}% "
+                     f"(Moderate) and >={JRC_FREQUENT}% (High); "
+                     f">={JRC_PERMANENT}% is classed as permanent water (6), "
+                     f"NOT as flood hazard. "
+                     f"THIS IS A SCREENING LAYER, NOT A FLOOD STUDY. The "
+                     f"channel network is derived from terrain, not from OSM, "
+                     f"so it does not depend on mapping coverage; but GLO-30 "
+                     f"is a SURFACE model, so canopy and buildings sit in the "
+                     f"elevations and routing is weakest in very flat "
+                     f"terrain. The depth-area exponent {EXP_B} is taken from "
+                     f"the general literature and is NOT fitted to Kenyan "
+                     f"gauge records; it should be revised when gauge data is "
+                     f"available. Closed basins raised more than "
+                     f"{FILL_TOL_M} m by DEM conditioning carry no HAND value "
+                     f"and are classified from observed water and terrain "
+                     f"wetness alone. " + ATTRIB),
+            "url": str(COG_PATH), "px": round(WORK_DEG * 111320, 1),
+            "nodata": NODATA,
+            "l": float(b.left), "b": float(b.bottom),
+            "r": float(b.right), "t": float(b.top),
+            "chk": md5_of(COG_PATH), "sid": source_id,
+        })
+        conn.execute(text("""
+            UPDATE metadata.datasets SET etl_status='ingested', updated_at=now()
+            WHERE code = 'hazards.flood'
+        """))
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status='success', rows_out = 1
+            WHERE run_id = :id
+        """), {"id": run_id})
+
+    print(f"\nDONE. Run {run_id} logged as success.")
+    print("REMEMBER: this layer is MODELLED. Every buyer-facing use of it must")
+    print("say so, and must not present it as a substitute for a site visit or")
+    print("a hydrological study.")
+
+# BaseException, NOT Exception, and this is load-bearing.
+# This script's own guards raise SystemExit, and Ctrl+C raises
+# KeyboardInterrupt. Both inherit from BaseException, so an
+# `except Exception` handler never fires for them and the
+# metadata.etl_runs row is left at 'running' forever. That bug left 12
+# orphan rows across a month of work, including runs PROGRESS.md
+# documents as failures. The trailing `raise` is unchanged: this logs
+# the failure and then gets out of the way.
+except BaseException as exc:
+    # Only the part-written classification is removed. The conditioning cache
+    # survives a failure on purpose: the next attempt is a threshold change,
+    # and it should not have to re-fill 117 million cells to try it.
+    TMP.unlink(missing_ok=True)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at=now(), run_status='failed', error_message=:e
+            WHERE run_id=:id
+        """), {"e": str(exc)[:2000], "id": run_id})
+    raise

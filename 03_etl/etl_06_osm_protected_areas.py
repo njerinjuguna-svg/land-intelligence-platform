@@ -1,0 +1,213 @@
+"""
+============================================================================
+ETL 06 - PROTECTED AREAS (environment.protected_areas)
+Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+What this script does:
+  Loads Kenya's protected areas (national parks, reserves, conservancies,
+  sanctuaries) from the OSM protected_areas polygon layer already on disk.
+
+Source note: OSM is the CATALOGUE BACKUP for this layer. The primary (KWS)
+is by-request and slow; WDPA is flagged non-commercial. This OSM layer is
+an honest interim: confidence 3, to be superseded by KWS boundaries once
+obtained. area_type is classified from the feature NAME (in Kenya, park
+names reliably state their type), falling back to OSM's own class.
+
+How to run (from 03_etl with venv active):
+  python etl_06_osm_protected_areas.py
+============================================================================
+"""
+
+import os
+import sys
+from datetime import date
+from pathlib import Path
+
+import geopandas as gpd
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+BASE = Path(__file__).resolve().parent
+RAW = BASE / "data" / "raw"
+SOURCE_NAME = "OpenStreetMap via Geofabrik (Kenya extract)"
+SOURCE_DATE = date(2026, 7, 16)
+PIPELINE = "etl_06_osm_protected_areas"
+LAYER = "gis_osm_protected_areas_a_free_1.shp"
+
+
+def classify(name, fclass):
+    """Decide area_type. Name keywords first (reliable in Kenya), then
+    OSM fclass, then a neutral default. Returns (area_type, confidence)."""
+    n = (name or "").lower()
+    if "marine" in n:
+        return "marine_protected", 3
+    if "corridor" in n:
+        return "wildlife_corridor", 3
+    if "national park" in n or n.endswith(" park"):
+        return "national_park", 3
+    if "national reserve" in n or "reserve" in n:
+        return "national_reserve", 3
+    if "conservancy" in n or "conservation" in n:
+        return "conservancy", 3
+    if "sanctuary" in n:
+        return "sanctuary", 3
+    # Fall back to OSM's own class
+    fc = (fclass or "").lower()
+    if fc == "national_park":
+        return "national_park", 3
+    if fc in ("nature_reserve", "protected_area"):
+        return "national_reserve", 2
+    # Unclassifiable: default to conservancy (broadest), low confidence
+    return "conservancy", 2
+
+
+def find_layer():
+    for shp in RAW.rglob(LAYER):
+        return str(shp)
+    for z in RAW.rglob("kenya-latest-free.shp.zip"):
+        return f"zip://{z}!{LAYER}"
+    return None
+
+
+load_dotenv(BASE / ".env")
+pw = os.getenv("DB_PASSWORD")
+if not pw or pw == "put_your_password_here":
+    sys.exit("ERROR: edit the .env file and set DB_PASSWORD first.")
+
+url = (
+    f"postgresql+psycopg2://{os.getenv('DB_USER', 'postgres')}:{pw}"
+    f"@{os.getenv('DB_HOST', 'localhost')}:{os.getenv('DB_PORT', '5432')}"
+    f"/{os.getenv('DB_NAME', 'land_intelligence_kenya')}"
+)
+engine = create_engine(url)
+with engine.connect() as conn:
+    conn.execute(text("SELECT 1"))
+print("Connected to database:", os.getenv("DB_NAME", "land_intelligence_kenya"))
+
+with engine.begin() as conn:
+    conn.execute(text("CREATE SCHEMA IF NOT EXISTS staging"))
+    source_id = conn.execute(
+        text("SELECT source_id FROM metadata.sources WHERE name = :n"),
+        {"n": SOURCE_NAME}).scalar()
+if source_id is None:
+    sys.exit("ERROR: Geofabrik source missing. Run etl_02_osm_roads.py first.")
+print(f"Source reused: {SOURCE_NAME} (source_id={source_id})")
+
+with engine.begin() as conn:
+    run_id = conn.execute(text("""
+        INSERT INTO metadata.etl_runs (pipeline, started_at, run_status)
+        VALUES (:p, now(), 'running') RETURNING run_id
+    """), {"p": PIPELINE}).scalar()
+print(f"ETL run opened (run_id={run_id})")
+
+try:
+    src = find_layer()
+    if src is None:
+        raise RuntimeError(f"{LAYER} not found under data/raw.")
+    print(f"\nReading protected areas from: {src}")
+    gdf = gpd.read_file(src)   # read all columns; we detect them below
+    print(f"   {len(gdf):,} protected-area polygons read")
+    print(f"   Columns present: {list(gdf.columns)}")
+
+    # Detect the name and class columns case-insensitively (publishers
+    # differ; never assume). Fall back gracefully if absent.
+    lower = {c.lower(): c for c in gdf.columns}
+    name_col = lower.get("name")
+    class_col = lower.get("fclass") or lower.get("code") or lower.get("type")
+    if name_col is None:
+        gdf["name"] = None          # no names in this layer; keep going
+        name_col = "name"
+    if class_col is None:
+        gdf["fclass"] = None
+        class_col = "fclass"
+    gdf = gdf.rename(columns={name_col: "name", class_col: "fclass"})
+
+    # Must have a name (schema requires it); unnamed polygons are dropped.
+    before = len(gdf)
+    gdf = gdf[gdf["name"].notna()
+              & (gdf["name"].astype(str).str.strip() != "")].copy()
+    if before - len(gdf):
+        print(f"   Dropping {before - len(gdf):,} unnamed polygons "
+              "(schema requires a name)")
+
+    types_conf = gdf.apply(
+        lambda r: classify(r["name"], r["fclass"]), axis=1, result_type="expand")
+    gdf["area_type"] = types_conf[0]
+    gdf["confidence"] = types_conf[1]
+    print("   Classified by type:")
+    for t, c in gdf["area_type"].value_counts().items():
+        print(f"      {t}: {c}")
+
+    if gdf.crs is None:
+        gdf = gdf.set_crs(4326)
+    elif gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(4326)
+    gdf["gid"] = range(len(gdf))
+
+    print(f"   Staging {len(gdf):,} polygons...")
+    gdf[["gid", "name", "area_type", "confidence", "geometry"]].to_postgis(
+        "protected_raw", engine, schema="staging",
+        if_exists="replace", chunksize=5000)
+
+    print("   Assigning counties and loading environment.protected_areas...")
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS staging.county_tiles"))
+        conn.execute(text("""
+            CREATE TABLE staging.county_tiles AS
+            SELECT county_code, ST_Subdivide(geom, 128) AS geom
+            FROM admin.counties
+        """))
+        conn.execute(text(
+            "CREATE INDEX ON staging.county_tiles USING gist (geom)"))
+        conn.execute(text(
+            "CREATE INDEX ON staging.protected_raw USING gist (geometry)"))
+        conn.execute(text("ANALYZE staging.county_tiles"))
+        conn.execute(text("ANALYZE staging.protected_raw"))
+        conn.execute(text(
+            "DELETE FROM environment.protected_areas WHERE source_id = :sid"),
+            {"sid": source_id})
+        # A park can span counties; DISTINCT ON keeps one row assigned to
+        # the first county alphabetically (geometry stays whole).
+        n = conn.execute(text("""
+            INSERT INTO environment.protected_areas
+                (name, area_type, authority, county_code, geom,
+                 source_id, source_date, confidence)
+            SELECT DISTINCT ON (p.gid)
+                   p.name, p.area_type, NULL, t.county_code,
+                   ST_Multi(ST_CollectionExtract(ST_MakeValid(p.geometry), 3)),
+                   :sid, :sd, p.confidence
+            FROM staging.protected_raw p
+            JOIN staging.county_tiles t ON ST_Intersects(p.geometry, t.geom)
+            ORDER BY p.gid, t.county_code
+        """), {"sid": source_id, "sd": SOURCE_DATE}).rowcount
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'success', rows_out = :r
+            WHERE run_id = :id
+        """), {"r": n, "id": run_id})
+        conn.execute(text("""
+            UPDATE metadata.datasets SET etl_status = 'ingested', updated_at = now()
+            WHERE code = 'environment.protected_areas'
+        """))
+    print(f"\nDONE. {n:,} protected areas loaded. Run {run_id} logged as success.")
+    print("Verify: SELECT area_type, count(*) FROM environment.protected_areas "
+          "GROUP BY 1 ORDER BY 2 DESC;")
+
+# BaseException, NOT Exception, and this is load-bearing.
+# This script's own guards raise SystemExit, and Ctrl+C raises
+# KeyboardInterrupt. Both inherit from BaseException, so an
+# `except Exception` handler never fires for them and the
+# metadata.etl_runs row is left at 'running' forever. That bug left 12
+# orphan rows across a month of work, including runs PROGRESS.md
+# documents as failures. The trailing `raise` is unchanged: this logs
+# the failure and then gets out of the way.
+except BaseException as exc:
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'failed', error_message = :e
+            WHERE run_id = :id
+        """), {"e": str(exc)[:2000], "id": run_id})
+    raise

@@ -1,0 +1,241 @@
+"""
+============================================================================
+ETL 08 - HEALTH FACILITIES (social.health)
+Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+Source: KMHFL (Kenya Master Health Facility List) exports via openAFRICA.
+This is the catalogue PRIMARY for health, authoritative, with KEPH levels,
+ownership and MFL codes.
+
+IMPORTANT - APPROXIMATE LOCATIONS: this openAFRICA export carries no GPS
+coordinates, only County / Sub county / Ward names. We therefore place
+each facility at the point-on-surface of its WARD polygon (which we
+already hold). Location confidence is 2 (ward-level, not exact). Every
+attribute (KEPH level, ownership, type, MFL code) is exact. Upgrade to
+true GPS later from the live KMHFR portal or healthsites.io.
+
+What this script does:
+  1. Reads the facility list + pharmacies CSVs, de-duplicates by MFL code
+  2. Keeps operational, non-closed facilities
+  3. Maps facility type, KEPH level, ownership onto our vocabulary
+  4. Matches each facility's county + ward to our admin.wards, and uses
+     that ward's point-on-surface as an approximate location
+  5. Loads into social.health with confidence 2
+
+How to run (from 03_etl with venv active):
+  python etl_08_kmhfl_health.py
+============================================================================
+"""
+
+import os
+import re
+import sys
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+BASE = Path(__file__).resolve().parent
+RAW = BASE / "data" / "raw" / "health"
+FACILITY_CSV = RAW / "cfafrica-_-data-team-_-outbreak-_-covid19-_-data-_-openafrica-uploads-_-kenya-hospital-ke.csv"
+PHARMACY_CSV = RAW / "cfafrica-_-data-team-_-outbreak-_-covid19-_-data-_-openafrica-uploads-_-kenya-pharmacies.csv"
+
+SOURCE_NAME = "KMHFL"               # matches sources.csv catalogue name
+SOURCE_URL = "https://kmhfr.health.go.ke"
+SOURCE_DATE = date.today()
+PIPELINE = "etl_08_kmhfl_health"
+
+
+def norm(s):
+    """Uppercase, letters+digits only, for name matching across spellings."""
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def map_facility_type(category, is_pharmacy):
+    if is_pharmacy:
+        return "pharmacy"
+    c = str(category).upper()
+    if "HOSPITAL" in c:
+        return "hospital"
+    if "HEALTH CENTRE" in c or "HEALTH CENTER" in c:
+        return "health_centre"
+    if "DISPENSARY" in c:
+        return "dispensary"
+    if "PHARMAC" in c or "CHEMIST" in c:
+        return "pharmacy"
+    # medical centre/clinic/nursing home/maternity and anything else
+    return "clinic"
+
+
+def map_keph(level):
+    m = re.search(r"([1-6])", str(level))
+    return int(m.group(1)) if m else None
+
+
+def map_ownership(owner_type):
+    o = str(owner_type).lower()
+    if "ministry" in o or "government" in o or "moh" in o or "public" in o:
+        return "moh"
+    if "faith" in o or "mission" in o or "religious" in o:
+        return "faith_based"
+    if "ngo" in o or "non-governmental" in o or "non governmental" in o:
+        return "ngo"
+    if "private" in o or "company" in o:
+        return "private"
+    return None
+
+
+def load_csv(path, is_pharmacy):
+    if not path.exists():
+        print(f"   NOTE: {path.name} not found, skipping.")
+        return pd.DataFrame()
+    df = pd.read_csv(path, dtype=str, low_memory=False)
+    df.columns = [c.strip() for c in df.columns]
+    out = pd.DataFrame()
+    out["mfl_code"] = df.get("Code")
+    out["name"] = df.get("Name")
+    out["facility_type"] = df.get("Facility_type_category").apply(
+        lambda c: map_facility_type(c, is_pharmacy)) \
+        if "Facility_type_category" in df.columns \
+        else ("pharmacy" if is_pharmacy else "clinic")
+    out["kephs_level"] = df.get("Keph level").apply(map_keph) \
+        if "Keph level" in df.columns else None
+    out["ownership"] = df.get("Owner type").apply(map_ownership) \
+        if "Owner type" in df.columns else None
+    out["county"] = df.get("County")
+    out["ward"] = df.get("Ward")
+    out["operation"] = df.get("Operation status")
+    out["closed"] = df.get("Closed")
+    return out
+
+
+load_dotenv(BASE / ".env")
+pw = os.getenv("DB_PASSWORD")
+if not pw or pw == "put_your_password_here":
+    sys.exit("ERROR: edit the .env file and set DB_PASSWORD first.")
+
+url = (
+    f"postgresql+psycopg2://{os.getenv('DB_USER', 'postgres')}:{pw}"
+    f"@{os.getenv('DB_HOST', 'localhost')}:{os.getenv('DB_PORT', '5432')}"
+    f"/{os.getenv('DB_NAME', 'land_intelligence_kenya')}"
+)
+engine = create_engine(url)
+with engine.connect() as conn:
+    conn.execute(text("SELECT 1"))
+print("Connected to database:", os.getenv("DB_NAME", "land_intelligence_kenya"))
+
+with engine.begin() as conn:
+    conn.execute(text("CREATE SCHEMA IF NOT EXISTS staging"))
+    source_id = conn.execute(text("""
+        INSERT INTO metadata.sources
+            (name, organisation, tier, url, license,
+             redistribution_allowed, api_available, notes)
+        VALUES (:n, 'Ministry of Health Kenya', 1, :u, 'GoK open data',
+                true, true, 'Master Health Facility List. openAFRICA export '
+                'lacks GPS; located to ward centroid pending KMHFR GPS.')
+        ON CONFLICT (name) DO UPDATE SET updated_at = now()
+        RETURNING source_id
+    """), {"n": SOURCE_NAME, "u": SOURCE_URL}).scalar()
+print(f"Source: {SOURCE_NAME} (source_id={source_id})")
+
+with engine.begin() as conn:
+    run_id = conn.execute(text("""
+        INSERT INTO metadata.etl_runs (pipeline, started_at, run_status)
+        VALUES (:p, now(), 'running') RETURNING run_id
+    """), {"p": PIPELINE}).scalar()
+print(f"ETL run opened (run_id={run_id})")
+
+try:
+    print("\nReading KMHFL CSVs...")
+    df = pd.concat([load_csv(FACILITY_CSV, False),
+                    load_csv(PHARMACY_CSV, True)], ignore_index=True)
+    if df.empty:
+        raise RuntimeError("No health CSVs found under data/raw/health/")
+    print(f"   {len(df):,} rows read (facilities + pharmacies)")
+
+    # Keep operational, non-closed; drop rows with no name.
+    df = df[df["name"].notna() & (df["name"].astype(str).str.strip() != "")]
+    df = df[df["operation"].fillna("Operational").str.strip().str.lower()
+            .eq("operational")]
+    df = df[~df["closed"].fillna("No").str.strip().str.lower().eq("yes")]
+    # De-duplicate by MFL code (keep first), ignoring 'None'/blank codes.
+    has_code = df["mfl_code"].notna() & ~df["mfl_code"].astype(str).str.lower()\
+        .isin(["none", "nan", ""])
+    coded = df[has_code].drop_duplicates(subset="mfl_code")
+    uncoded = df[~has_code]
+    df = pd.concat([coded, uncoded], ignore_index=True)
+    print(f"   {len(df):,} operational facilities after de-duplication")
+
+    df["county_norm"] = df["county"].apply(norm)
+    df["ward_norm"] = df["ward"].apply(norm)
+    df["gid"] = range(len(df))
+
+    print("   Facility types:")
+    for t, c in df["facility_type"].value_counts().items():
+        print(f"      {t}: {c:,}")
+
+    stage = df[["gid", "mfl_code", "name", "facility_type", "kephs_level",
+                "ownership", "county_norm", "ward_norm"]].copy()
+    stage.to_sql("health_raw", engine, schema="staging",
+                 if_exists="replace", index=False, chunksize=5000)
+
+    print("   Geocoding to ward centroids and loading social.health...")
+    with engine.begin() as conn:
+        conn.execute(text(
+            "DELETE FROM social.health WHERE source_id = :sid"),
+            {"sid": source_id})
+        # Match each facility's county+ward to admin.wards (via its county),
+        # use that ward's point-on-surface as an approximate location.
+        n = conn.execute(text("""
+            INSERT INTO social.health
+                (name, facility_type, kephs_level, ownership, mfl_code,
+                 county_code, geom, source_id, source_date, confidence)
+            SELECT h.name, h.facility_type, h.kephs_level, h.ownership,
+                   NULLIF(h.mfl_code, 'None'),
+                   c.county_code,
+                   w.geom_pt,
+                   :sid, :sd, 2
+            FROM staging.health_raw h
+            LEFT JOIN admin.counties c
+                   ON regexp_replace(lower(c.name),'[^a-z0-9]','','g') = h.county_norm
+            LEFT JOIN LATERAL (
+                   SELECT ST_PointOnSurface(w.geom) AS geom_pt
+                   FROM admin.wards w
+                   WHERE w.county_code = c.county_code
+                     AND regexp_replace(lower(w.name),'[^a-z0-9]','','g') = h.ward_norm
+                   LIMIT 1
+            ) w ON true
+        """), {"sid": source_id, "sd": SOURCE_DATE}).rowcount
+
+        located = conn.execute(text("""
+            SELECT count(*) FROM social.health
+            WHERE source_id = :sid AND geom IS NOT NULL
+        """), {"sid": source_id}).scalar()
+
+    print(f"   {n:,} facilities loaded, {located:,} placed at a ward "
+          f"({100*located//max(n,1)}%); rest await GPS or ward-name fix")
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'success', rows_out = :r
+            WHERE run_id = :id
+        """), {"r": n, "id": run_id})
+        conn.execute(text("""
+            UPDATE metadata.datasets SET etl_status = 'ingested', updated_at = now()
+            WHERE code = 'social.health'
+        """))
+    print(f"\nDONE. {n:,} health facilities loaded. Run {run_id} success.")
+    print("Verify: SELECT facility_type, count(*) FROM social.health "
+          "GROUP BY 1 ORDER BY 2 DESC;")
+
+except Exception as exc:
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'failed', error_message = :e
+            WHERE run_id = :id
+        """), {"e": str(exc)[:2000], "id": run_id})
+    raise

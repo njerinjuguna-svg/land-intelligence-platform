@@ -1,0 +1,457 @@
+"""
+============================================================================
+ETL 19 - ESA WORLDCOVER LAND COVER (satellite.landcover) at 10 m
+Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+What this script does:
+  Downloads the ESA WorldCover 2021 v200 tiles covering Kenya, stitches them
+  into one national 10 m land cover map, saves it as a COG and catalogues it.
+
+Why this layer earns its place:
+  It answers "what is this land actually DOING right now", which is the
+  question a buyer asks without knowing they are asking it. Cropland means
+  someone farms it. Built-up means the area is developing. Permanent water or
+  herbaceous wetland on a parcel is a red flag no title deed will mention.
+  Bare or sparse vegetation in a place the seller called "prime agricultural"
+  is a contradiction worth surfacing.
+
+  It is also, at 10 m, the SHARPEST layer we hold. The DEM and soils are 30 m,
+  rainfall is 5 km. A quarter-acre plot in Kenya is roughly 1,000 square
+  metres, so a 30 m pixel is a tenth of the plot but a 10 m pixel is a
+  hundredth. This is the first layer with enough detail to say something
+  specific about a SMALL parcel rather than about its neighbourhood.
+
+Source and licence:
+  ESA WorldCover 10 m 2021 v200, from the AWS open data bucket. Already
+  EPSG:4326, already a COG, delivered in 3x3 degree tiles. CC-BY-4.0, so
+  commercial use is fine with attribution. Note v200 (2021) is the CURRENT
+  version: v100 is the older 2020 map with a weaker algorithm, do not use it.
+
+  No reprojection is needed here, which is why this is a tile download rather
+  than the fetch-then-reproject dance etl_17 needs. Whole-file sequential
+  downloads are what this connection handles best (see etl_13).
+
+The memory-safe mosaic (same idea as etl_14):
+  Kenya at 10 m is roughly 96,000 x 122,000 pixels, about 11.7 BILLION. Held
+  in memory that is ~12 GB, which would stop the laptop dead. So we never hold
+  it. We create an empty compressed GeoTIFF of the full size on DISK, then copy
+  each source tile in one horizontal strip at a time into its correct window.
+  Peak memory stays around 40 MB.
+
+Categorical data rules (both matter, and both are easy to get wrong):
+  - Overviews MUST use NEAREST resampling. Averaging class codes is nonsense:
+    the average of Built-up (50) and Bare (60) is 55, which is not a class at
+    all, and a zoomed-out map would fill with codes that do not exist.
+  - Nodata is 0. WorldCover uses 0 for "no data", and every real class is a
+    non-zero code, so there is no ambiguity.
+
+Class legend (WorldCover v200):
+   10 Tree cover          20 Shrubland           30 Grassland
+   40 Cropland            50 Built-up            60 Bare / sparse vegetation
+   70 Snow and ice        80 Permanent water     90 Herbaceous wetland
+   95 Mangroves          100 Moss and lichen
+
+Disk space: the tiles are roughly 0.5 GB, and the mosaic plus the COG exist at
+the same time for a moment. Have ~3 GB free on E: before running.
+
+How to run (from 03_etl with venv active):
+  python etl_19_worldcover_landcover.py
+============================================================================
+"""
+
+import os
+import sys
+import time
+import math
+import hashlib
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+# Same PROJ/GDAL fix as every raster script here. Must precede rasterio.
+for _k in ("PROJ_LIB", "PROJ_DATA", "GDAL_DATA"):
+    os.environ.pop(_k, None)
+
+import numpy as np
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+try:
+    import rasterio
+    from rasterio.windows import Window
+    from rasterio.shutil import copy as rio_copy
+except ImportError:
+    sys.exit("ERROR: rasterio missing. With venv active: pip install rasterio")
+
+BASE = Path(__file__).resolve().parent
+PROJECT = BASE.parent
+PIPELINE = "etl_19_worldcover_landcover"
+
+RAW_DIR = BASE / "data" / "raw" / "satellite" / "worldcover"
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+COG_DIR = PROJECT / "06_rasters" / "cog" / "satellite"
+COG_DIR.mkdir(parents=True, exist_ok=True)
+
+COG_NAME = "satellite_landcover_esaworldcover_10m_2021.tif"
+COG_PATH = COG_DIR / COG_NAME
+TMP_PATH = RAW_DIR / "_mosaic_tmp.tif"
+
+BUCKET = "https://esa-worldcover.s3.amazonaws.com/v200/2021/map"
+TILE_DEG = 3                      # WorldCover ships 3x3 degree tiles
+PAD_DEG = 0.02                    # small margin so border parcels are covered
+NODATA = 0
+STRIP = 1024                      # rows per copy step: ~37 MB in memory
+
+ATTRIB = ("(c) ESA WorldCover project 2021 / Contains modified Copernicus "
+          "Sentinel data (2021) processed by ESA WorldCover consortium. "
+          "CC-BY-4.0. Zanaga et al. 2022, doi:10.5281/zenodo.7254221.")
+
+CLASSES = {
+    10: "Tree cover", 20: "Shrubland", 30: "Grassland", 40: "Cropland",
+    50: "Built-up", 60: "Bare / sparse vegetation", 70: "Snow and ice",
+    80: "Permanent water", 90: "Herbaceous wetland", 95: "Mangroves",
+    100: "Moss and lichen",
+}
+
+# Roughly what Kenya should look like, for the sanity check at the end. These
+# are ballpark national shares, not precise figures: the point is to catch a
+# result that is obviously wrong (say 60% built-up, or no shrubland at all),
+# not to grade the product to the decimal.
+EXPECTED = {
+    "Shrubland": "35-55%", "Grassland": "15-30%", "Tree cover": "5-12%",
+    "Cropland": "8-15%", "Bare / sparse vegetation": "3-12%",
+    "Built-up": "0.3-1.5%", "Permanent water": "1-3%",
+}
+
+
+def md5_of(path, chunk=8 * 1024 * 1024):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def tile_name(lat0, lon0):
+    """WorldCover names a tile by its SOUTH WEST corner, e.g. S06E039 is the
+    tile covering latitude -6 to -3 and longitude 39 to 42."""
+    ns = f"N{lat0:02d}" if lat0 >= 0 else f"S{abs(lat0):02d}"
+    ew = f"E{lon0:03d}" if lon0 >= 0 else f"W{abs(lon0):03d}"
+    return f"{ns}{ew}"
+
+
+def download(url, dest, retries=5, timeout=180):
+    """Sequential chunked download with retries, resumable at file level."""
+    part = dest.with_suffix(dest.suffix + ".part")
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "LIP-ETL/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r, \
+                    open(part, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            part.replace(dest)
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 404):
+                part.unlink(missing_ok=True)
+                return False          # tile genuinely does not exist
+        except (urllib.error.URLError, TimeoutError, OSError):
+            pass
+        part.unlink(missing_ok=True)
+        time.sleep(2 * attempt)
+    return False
+
+
+load_dotenv(BASE / ".env")
+pw = os.getenv("DB_PASSWORD")
+if not pw or pw == "put_your_password_here":
+    sys.exit("ERROR: edit the .env file and set DB_PASSWORD first.")
+
+engine = create_engine(
+    f"postgresql+psycopg2://{os.getenv('DB_USER', 'postgres')}:{pw}"
+    f"@{os.getenv('DB_HOST', 'localhost')}:{os.getenv('DB_PORT', '5432')}"
+    f"/{os.getenv('DB_NAME', 'land_intelligence_kenya')}")
+with engine.connect() as conn:
+    conn.execute(text("SELECT 1"))
+print("Connected to database:", os.getenv("DB_NAME", "land_intelligence_kenya"))
+
+with engine.begin() as conn:
+    run_id = conn.execute(text("""
+        INSERT INTO metadata.etl_runs (pipeline, started_at, run_status)
+        VALUES (:p, now(), 'running') RETURNING run_id
+    """), {"p": PIPELINE}).scalar()
+print(f"ETL run opened (run_id={run_id})")
+
+try:
+    # -----------------------------------------------------------------------
+    # 1. Which tiles does Kenya need?
+    # -----------------------------------------------------------------------
+    with engine.connect() as conn:
+        xmin, xmax, ymin, ymax = conn.execute(text("""
+            SELECT ST_XMin(e), ST_XMax(e), ST_YMin(e), ST_YMax(e)
+            FROM (SELECT ST_Extent(geom) AS e FROM admin.country) t
+        """)).one()
+        source_id = conn.execute(text(
+            "SELECT source_id FROM metadata.sources WHERE name = 'ESA WorldCover'"
+        )).scalar()
+        dataset_id = conn.execute(text(
+            "SELECT dataset_id FROM metadata.datasets WHERE code = 'satellite.landcover'"
+        )).scalar()
+    if source_id is None or dataset_id is None:
+        raise SystemExit("ESA WorldCover source or satellite.landcover dataset "
+                         "missing from metadata. Run etl_04 first.")
+
+    # Cast away NumPy/Decimal types straight out of the database, then pad.
+    xmin, xmax = float(xmin) - PAD_DEG, float(xmax) + PAD_DEG
+    ymin, ymax = float(ymin) - PAD_DEG, float(ymax) + PAD_DEG
+    print(f"Kenya bbox (padded): lon {xmin:.3f}..{xmax:.3f}, "
+          f"lat {ymin:.3f}..{ymax:.3f}")
+
+    lat0s = list(range(int(math.floor(ymin / TILE_DEG)) * TILE_DEG,
+                       int(math.floor(ymax / TILE_DEG)) * TILE_DEG + 1, TILE_DEG))
+    lon0s = list(range(int(math.floor(xmin / TILE_DEG)) * TILE_DEG,
+                       int(math.floor(xmax / TILE_DEG)) * TILE_DEG + 1, TILE_DEG))
+    wanted = [tile_name(la, lo) for la in lat0s for lo in lon0s]
+    print(f"Tiles needed: {len(wanted)}  ->  {', '.join(wanted)}")
+
+    # -----------------------------------------------------------------------
+    # 2. Download them (sequential whole files, resumable)
+    # -----------------------------------------------------------------------
+    have, absent = [], []
+    for i, t in enumerate(wanted, 1):
+        fn = f"ESA_WorldCover_10m_2021_v200_{t}_Map.tif"
+        dest = RAW_DIR / fn
+        if dest.exists() and dest.stat().st_size > 1_000_000:
+            have.append(dest)
+            print(f"  [{i:>2}/{len(wanted)}] {t}  already have it "
+                  f"({dest.stat().st_size/1e6:.0f} MB)")
+            continue
+        print(f"  [{i:>2}/{len(wanted)}] {t}  downloading ...", flush=True)
+        if download(f"{BUCKET}/{fn}", dest):
+            have.append(dest)
+            print(f"       done ({dest.stat().st_size/1e6:.0f} MB)")
+        else:
+            # WorldCover only publishes tiles containing land. An all-ocean
+            # tile simply does not exist, which is fine and not an error.
+            absent.append(t)
+            print(f"       not published (ocean-only tile), skipping")
+
+    if not have:
+        raise SystemExit("No WorldCover tiles downloaded. Check connectivity.")
+    print(f"\n{len(have)} tiles ready"
+          + (f", {len(absent)} not published: {absent}" if absent else ""))
+
+    # -----------------------------------------------------------------------
+    # 3. Build the national canvas, aligned to the WorldCover pixel grid
+    # -----------------------------------------------------------------------
+    with rasterio.open(have[0]) as s0:
+        px = s0.transform.a                 # degrees per pixel (1/12000)
+        if abs(px - 1 / 12000) > 1e-12:
+            print(f"  NOTE: pixel size {px} is not the expected 1/12000. "
+                  f"Proceeding with the value read from the file.")
+        dtype = s0.dtypes[0]
+        src_nodata = s0.nodata if s0.nodata is not None else NODATA
+
+    # Snap the canvas to the source grid. If we did not, every tile would land
+    # on a fractional pixel offset and we would have to resample categorical
+    # classes, which is exactly what must never happen to class codes.
+    x0 = math.floor(xmin / px) * px
+    x1 = math.ceil(xmax / px) * px
+    y1 = math.ceil(ymax / px) * px          # top
+    y0 = math.floor(ymin / px) * px         # bottom
+    W = int(round((x1 - x0) / px))
+    H = int(round((y1 - y0) / px))
+    canvas_transform = rasterio.Affine(px, 0, x0, 0, -px, y1)
+    print(f"National canvas: {W:,} x {H:,} px "
+          f"({W * H / 1e9:.2f} billion), ~{px * 111320:.1f} m")
+
+    prof = {
+        "driver": "GTiff", "dtype": dtype, "count": 1,
+        "crs": "EPSG:4326", "transform": canvas_transform,
+        "width": W, "height": H, "nodata": NODATA,
+        "tiled": True, "blockxsize": 512, "blockysize": 512,
+        "compress": "DEFLATE", "bigtiff": "YES",
+    }
+
+    # WE WALK THE CANVAS, NOT THE TILES. This is the one structural difference
+    # from etl_14, and it matters because this mosaic is COMPRESSED.
+    #
+    # The obvious approach is to loop over tiles and paste each one in. But a
+    # 3 degree tile is 36,000 px wide and our blocks are 512, and 36,000 is not
+    # a multiple of 512, so tile edges fall in the MIDDLE of blocks. Two
+    # neighbouring tiles then both write into the same seam blocks, and for a
+    # compressed file that means GDAL must decompress, merge and recompress
+    # those blocks on the second visit. etl_14 got away with tile-by-tile
+    # because its scratch file was uncompressed; we cannot afford that here,
+    # since uncompressed this canvas is about 12 GB.
+    #
+    # So instead we sweep down the canvas in horizontal bands, gather whatever
+    # tiles overlap each band, and write each block row exactly once, in order.
+    # One full-width band is W x 512 bytes, roughly 49 MB, which is cheap.
+    hist = np.zeros(256, dtype="int64")
+    t_start = time.time()
+
+    handles = []
+    for tpath in have:
+        src = rasterio.open(tpath)
+        handles.append({
+            "src": src, "name": tpath.name[-15:-8],
+            "col0": int(round((src.transform.c - x0) / px)),
+            "row0": int(round((y1 - src.transform.f) / px)),
+        })
+        print(f"  {tpath.name[-15:-8]} sits at canvas col {handles[-1]['col0']:,}, "
+              f"row {handles[-1]['row0']:,}")
+
+    try:
+        with rasterio.open(TMP_PATH, "w", **prof) as dst:
+            nstrips = math.ceil(H / STRIP)
+            for si, r in enumerate(range(0, H, STRIP), 1):
+                rh = min(STRIP, H - r)
+                buf = np.full((rh, W), NODATA, dtype=dtype)
+                for t in handles:
+                    src = t["src"]
+                    rf = max(r, t["row0"])
+                    rt = min(r + rh, t["row0"] + src.height)
+                    cf = max(0, t["col0"])
+                    ct = min(W, t["col0"] + src.width)
+                    if rt <= rf or ct <= cf:
+                        continue
+                    buf[rf - r:rt - r, cf:ct] = src.read(
+                        1, window=Window(cf - t["col0"], rf - t["row0"],
+                                         ct - cf, rt - rf))
+                dst.write(buf, 1, window=Window(0, r, W, rh))
+                hist += np.bincount(buf.ravel(), minlength=256)
+                del buf
+                if si % 10 == 0 or si == nstrips:
+                    el = time.time() - t_start
+                    frac = si / nstrips
+                    print(f"  band {si}/{nstrips} ({100*frac:5.1f}%)  "
+                          f"{el/60:.1f} min elapsed, "
+                          f"ETA {(el/frac - el)/60:.0f} min", flush=True)
+    finally:
+        for t in handles:
+            t["src"].close()
+
+    # -----------------------------------------------------------------------
+    # 4. Sanity check BEFORE we commit anything to the catalogue
+    # -----------------------------------------------------------------------
+    valid = hist.sum() - hist[NODATA]
+    if valid == 0:
+        raise SystemExit("Every pixel is nodata. The mosaic placed nothing. "
+                         "Check the tile-to-canvas offsets printed above.")
+    print(f"\nClass composition over the canvas "
+          f"({valid/1e9:.2f} billion classified pixels):")
+    print(f"  {'class':28}{'share':>9}{'expected':>12}")
+    unknown = []
+    for code in np.nonzero(hist)[0]:
+        if code == NODATA:
+            continue
+        name = CLASSES.get(int(code))
+        share = 100.0 * hist[code] / valid
+        if name is None:
+            unknown.append(int(code))
+            print(f"  {'code ' + str(int(code)) + ' (UNKNOWN)':28}{share:>8.2f}%"
+                  f"{'??':>12}")
+        else:
+            print(f"  {name:28}{share:>8.2f}%{EXPECTED.get(name, ''):>12}")
+    print(f"  {'(nodata / ocean)':28}{100.0*hist[NODATA]/hist.sum():>8.2f}%")
+
+    if unknown:
+        raise SystemExit(
+            f"Unknown class codes present: {unknown}. WorldCover v200 defines "
+            f"only {sorted(CLASSES)}. Something is wrong with the read; "
+            f"refusing to catalogue a layer with classes we cannot name.")
+
+    # A single class swallowing almost everything means the mosaic went wrong
+    # (for example every tile written into the same window). Measured against
+    # CLASSIFIED pixels only, since nodata legitimately covers the ocean corner
+    # and would otherwise dominate this check for the wrong reason.
+    real = hist.copy()
+    real[NODATA] = 0
+    top_share = 100.0 * real.max() / valid
+    if top_share > 90.0:
+        raise SystemExit(f"One class holds {top_share:.1f}% of all classified "
+                         f"pixels. That is not Kenya. Refusing to catalogue.")
+
+    # -----------------------------------------------------------------------
+    # 5. COG (NEAREST overviews: never average a class code) + catalogue
+    # -----------------------------------------------------------------------
+    print("\nConverting to COG (nearest overviews, categorical) ...")
+    if COG_PATH.exists():
+        COG_PATH.unlink()
+    rio_copy(str(TMP_PATH), str(COG_PATH), driver="COG",
+             compress="DEFLATE", overview_resampling="nearest", BIGTIFF="YES")
+    TMP_PATH.unlink(missing_ok=True)
+    size_mb = COG_PATH.stat().st_size / 1_000_000
+    print(f"COG written: {COG_PATH.name}  ({size_mb:.0f} MB)")
+
+    with rasterio.open(COG_PATH) as s:
+        b = s.bounds
+        print(f"  {s.width:,} x {s.height:,} px, overviews {s.overviews(1)}")
+
+    legend = ", ".join(f"{k}={v}" for k, v in sorted(CLASSES.items()))
+    with engine.begin() as conn:
+        conn.execute(text("""
+            DELETE FROM metadata.raster_catalog
+            WHERE dataset_id = :did AND variable = 'landcover'
+        """), {"did": dataset_id})
+        conn.execute(text("""
+            INSERT INTO metadata.raster_catalog
+                (dataset_id, name, variable, storage_url, format, pixel_size_m,
+                 band_count, nodata_value, temporal_start, temporal_end, bbox,
+                 checksum, source_id, source_date, confidence)
+            VALUES
+                (:did, :name, 'landcover', :url, 'COG', :px, 1, :nodata,
+                 DATE '2021-01-01', DATE '2021-12-31',
+                 ST_MakeEnvelope(:l, :b, :r, :t, 4326),
+                 :chk, :sid, DATE '2022-10-01', 4)
+        """), {
+            "did": dataset_id,
+            "name": (f"ESA WorldCover 2021 v200 land cover, 10 m, 11 classes "
+                     f"({legend}); 0=nodata. " + ATTRIB),
+            "url": str(COG_PATH),
+            "px": round(px * 111320, 1),
+            "nodata": NODATA,
+            "l": float(b.left), "b": float(b.bottom),
+            "r": float(b.right), "t": float(b.top),
+            "chk": md5_of(COG_PATH), "sid": source_id,
+        })
+        conn.execute(text("""
+            UPDATE metadata.datasets SET etl_status = 'ingested', updated_at = now()
+            WHERE code = 'satellite.landcover'
+        """))
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'success', rows_out = 1
+            WHERE run_id = :id
+        """), {"id": run_id})
+
+    print(f"\nDONE. Run {run_id} logged as success.")
+    print("QGIS: load it and zoom to Nairobi. Built-up (50) should trace the "
+          "city and the main roads out of it. Cropland (40) should dominate "
+          "the west around Kakamega and Kisumu. Shrubland (20) should cover "
+          "the north and east. Mangroves (95) should appear ONLY on the coast "
+          "around Lamu and the Tana delta, which is a good spot check: if "
+          "mangroves show up inland, the mosaic is misaligned.")
+
+# BaseException, NOT Exception, and this is load-bearing.
+# This script's own guards raise SystemExit, and Ctrl+C raises
+# KeyboardInterrupt. Both inherit from BaseException, so an
+# `except Exception` handler never fires for them and the
+# metadata.etl_runs row is left at 'running' forever. That bug left 12
+# orphan rows across a month of work, including runs PROGRESS.md
+# documents as failures. The trailing `raise` is unchanged: this logs
+# the failure and then gets out of the way.
+except BaseException as exc:
+    TMP_PATH.unlink(missing_ok=True)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'failed', error_message = :e
+            WHERE run_id = :id
+        """), {"e": str(exc)[:2000], "id": run_id})
+    raise

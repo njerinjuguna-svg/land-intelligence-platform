@@ -1,0 +1,474 @@
+r"""
+============================================================================
+ETL 27 - climate.rainfall RECENT YEARS and ANOMALY
+Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+WHAT THIS ADDS, AND WHY THE EXISTING LAYER IS NOT OUT OF DATE
+  climate.rainfall holds the 1991-2020 CHIRPS normal. Njeri asked whether a
+  2020 endpoint is stale. For the question that layer answers -- "can I farm
+  here" -- it is not: 1991-2020 is the CURRENT WMO standard 30-year normal
+  and stays current until 2021-2050 replaces it. A three-year average would
+  be WORSE for that question, because it would bake in whatever drought or
+  wet cycle happened to fall in the window.
+
+  But a normal cannot answer "what has it been like lately", and that is a
+  real question for a buyer. Kenya had a severe drought 2020-2023 and a wet
+  2024. A parcel's recent experience is not its climatology.
+
+  So this is a SECOND layer, not a replacement:
+    rainfall_recent_mean   mean annual total over the last few years
+    rainfall_anomaly_pct   that mean as a PERCENTAGE OF THE NORMAL
+
+  The anomaly is the useful one. "This area has run at 68% of its long-term
+  average for five years" is a statement a farmer or a buyer can act on;
+  "this area gets 640 mm" is not, without knowing what it usually gets.
+
+WHY PERCENT OF NORMAL AND NOT MILLIMETRES BELOW
+  A 200 mm shortfall is catastrophic in Turkana and unremarkable in Kericho.
+  Expressing the deficit relative to what a place normally receives makes
+  arid and humid Kenya comparable, which a millimetre difference does not.
+  Same reasoning as the flood layer's catchment scaling.
+
+SOURCE
+  CHIRPS v3.0 annual, Climate Hazards Center, UC Santa Barbara. Public
+  domain. v3 became operational in 2025 with roughly twice the station
+  observations of v2 across Africa, and runs to mid-2026. CHIRPS v2
+  production ends after December 2026, so this uses v3 and falls back to v2
+  only if v3 is unavailable for a year.
+
+  URL patterns are PROBED, not assumed -- the same list etl_18 uses, because
+  CHC has moved these paths before.
+
+CAVEAT CARRIED FORWARD FROM etl_18
+  The rainfall layer RUNS WET, roughly +145 mm across 16 reference towns.
+  Part of that is CHIRPS over steep terrain with thin gauge density, and
+  part is that our reference figures were approximate rather than station
+  records. The ANOMALY is less exposed to this than the absolute value,
+  because a consistent bias largely cancels in a ratio -- but it does not
+  cancel exactly, so do not present anomaly to a precision it has not
+  earned.
+
+How to run (from 03_etl with venv active):
+  python etl_27_rainfall_recent.py --probe-only
+  python etl_27_rainfall_recent.py
+============================================================================
+"""
+
+import os
+import sys
+import time
+import hashlib
+import urllib.request
+import urllib.error
+import http.client
+from pathlib import Path
+
+for _k in ("PROJ_LIB", "PROJ_DATA", "GDAL_DATA"):
+    os.environ.pop(_k, None)
+
+import numpy as np
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+try:
+    import rasterio
+    from rasterio.warp import reproject, Resampling
+    from rasterio.features import rasterize
+    from rasterio.shutil import copy as rio_copy
+except ImportError as e:
+    sys.exit(f"ERROR: missing dependency ({e}). With venv active: "
+             f"pip install rasterio")
+
+try:
+    import geopandas as gpd
+except ImportError:
+    sys.exit("ERROR: geopandas missing. With venv active: pip install geopandas")
+
+import warnings
+# All-NaN columns are ocean cells outside every CHIRPS observation. nanmean
+# warns and returns NaN, which is the correct answer; the warning is noise.
+warnings.filterwarnings("ignore", message="Mean of empty slice")
+warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+
+BASE = Path(__file__).resolve().parent
+PROJECT = BASE.parent
+PIPELINE = "etl_27_rainfall_recent"
+RAW_DIR = BASE / "data" / "raw" / "climate"
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+COG_DIR = PROJECT / "06_rasters" / "cog" / "climate"
+COG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Same candidate list etl_18 probes. CHC has relocated these paths before,
+# so the script asks rather than assumes.
+URL_PATTERNS = [
+    "https://data.chc.ucsb.edu/products/CHIRPS/v3.0/annual/africa/tifs/"
+    "chirps-v3.0.{y}.tif",
+    "https://data.chc.ucsb.edu/products/CHIRPS/v3.0/annual/global/tifs/"
+    "chirps-v3.0.{y}.tif",
+    "https://data.chc.ucsb.edu/products/CHIRPS-2.0/africa_annual/tifs/"
+    "chirps-v2.0.{y}.tif",
+    "https://data.chc.ucsb.edu/products/CHIRPS-2.0/global_annual/tifs/"
+    "chirps-v2.0.{y}.tif",
+]
+
+# The last complete calendar years. 2026 is deliberately excluded: CHIRPS
+# runs to mid-2026, and a part-year total would read as a catastrophic
+# drought. A partial year is not a dry year.
+RECENT_YEARS = [int(y) for y in os.getenv(
+    "RAINFALL_RECENT_YEARS", "2021,2022,2023,2024,2025").split(",")]
+MIN_YEARS = 3                 # below this, "recent mean" is not a mean
+
+PAD_DEG = 0.05
+MAX_SANE_MM = 15_000.0        # reject, never clip (lesson from pH and etl_18)
+NODATA = -9999.0
+
+
+def md5_of(path, chunk=8 * 1024 * 1024):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(chunk), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def url_exists(url, timeout=45):
+    try:
+        req = urllib.request.Request(url, method="HEAD",
+                                     headers={"User-Agent": "LIP-ETL/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def download(url, dest, retries=6, timeout=180):
+    part = dest.with_suffix(dest.suffix + ".part")
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "LIP-ETL/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                expected = r.headers.get("Content-Length")
+                expected = int(expected) if expected and expected.isdigit() \
+                    else None
+                got = 0
+                with open(part, "wb") as f:
+                    while True:
+                        c = r.read(1 << 20)
+                        if not c:
+                            break
+                        f.write(c)
+                        got += len(c)
+            # A size check is not an integrity check, but a byte-count
+            # mismatch IS a definite failure. Lesson from the truncated
+            # Black Marble tile in etl_26.
+            if expected is not None and got != expected:
+                print(f"      short by {expected-got:,} bytes, retrying")
+                part.unlink(missing_ok=True)
+                time.sleep(3 * attempt)
+                continue
+            part.replace(dest)
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 404):
+                part.unlink(missing_ok=True)
+                return False
+        except (urllib.error.URLError, TimeoutError, OSError,
+                http.client.HTTPException):
+            pass
+        part.unlink(missing_ok=True)
+        time.sleep(4 * attempt)
+    return False
+
+
+def main():
+    probe_only = "--probe-only" in sys.argv
+    load_dotenv(BASE / ".env")
+    pw = os.getenv("DB_PASSWORD")
+    if not pw or pw == "put_your_password_here":
+        sys.exit("ERROR: set DB_PASSWORD in .env first.")
+    url = (f"postgresql+psycopg2://{os.getenv('DB_USER','postgres')}:{pw}"
+           f"@{os.getenv('DB_HOST','localhost')}:{os.getenv('DB_PORT','5432')}"
+           f"/{os.getenv('DB_NAME','land_intelligence_kenya')}")
+    engine = create_engine(url)
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    print("Connected to database:",
+          os.getenv("DB_NAME", "land_intelligence_kenya"))
+
+    # -----------------------------------------------------------------------
+    # 1. Find the existing normal. The anomaly is meaningless without it, so
+    #    this fails loudly rather than producing a bare recent mean.
+    # -----------------------------------------------------------------------
+    with engine.connect() as conn:
+        normal_path = conn.execute(text("""
+            SELECT storage_url FROM metadata.raster_catalog
+            WHERE variable = 'rainfall' AND status = 'active'
+            ORDER BY raster_id DESC LIMIT 1
+        """)).scalar()
+        dataset_id = conn.execute(text(
+            "SELECT dataset_id FROM metadata.datasets "
+            "WHERE code = 'climate.rainfall'")).scalar()
+    if not normal_path or not Path(normal_path).exists():
+        sys.exit("The 1991-2020 normal is not in the catalogue. Run etl_18 "
+                 "first: the anomaly is computed against it.")
+    print(f"Normal: {Path(normal_path).name}")
+
+    # -----------------------------------------------------------------------
+    # 2. Probe which URL pattern is live, then which years exist.
+    # -----------------------------------------------------------------------
+    print(f"\n1. Probing CHIRPS for {RECENT_YEARS} ...")
+    pattern = None
+    for p in URL_PATTERNS:
+        test = p.format(y=RECENT_YEARS[0])
+        ok = url_exists(test)
+        print(f"   {'OK  ' if ok else 'no  '} {test}")
+        if ok:
+            pattern = p
+            break
+    if pattern is None:
+        sys.exit("No CHIRPS pattern responded. CHC may have moved the paths "
+                 "again; check https://data.chc.ucsb.edu/products/CHIRPS/")
+
+    have = {}
+    for y in RECENT_YEARS:
+        u = pattern.format(y=y)
+        if url_exists(u):
+            have[y] = u
+            print(f"   {y}  available")
+        else:
+            print(f"   {y}  NOT PUBLISHED YET (skipped)")
+    if len(have) < MIN_YEARS:
+        sys.exit(f"Only {len(have)} year(s) available; need at least "
+                 f"{MIN_YEARS} for a 'recent mean' to mean anything.")
+    if probe_only:
+        print("\n   --probe-only: stopping before any download.")
+        return
+
+    with engine.begin() as conn:
+        run_id = conn.execute(text("""
+            INSERT INTO metadata.etl_runs (pipeline, started_at, run_status)
+            VALUES (:p, now(), 'running') RETURNING run_id
+        """), {"p": PIPELINE}).scalar()
+    print(f"ETL run opened (run_id={run_id})")
+
+    try:
+        # -------------------------------------------------------------------
+        # 3. Download, then cut Kenya on the NORMAL's own grid.
+        #    Reprojecting onto the existing grid rather than a fresh one means
+        #    the anomaly is a pixel-by-pixel ratio with no resampling in
+        #    between, which is the only way the division is honest.
+        # -------------------------------------------------------------------
+        print("\n2. Downloading and stacking ...")
+        with rasterio.open(normal_path) as nsrc:
+            nprof = nsrc.profile.copy()
+            ntransform = nsrc.transform
+            nw, nh = nsrc.width, nsrc.height
+            ncrs = nsrc.crs
+            nscale = (nsrc.scales[0] if nsrc.scales else 1.0)
+            normal = nsrc.read(1).astype("float32") * nscale
+            nnod = nsrc.nodata
+        if nnod is not None:
+            normal[normal == nnod * nscale] = np.nan
+        normal[normal <= 0] = np.nan          # cannot divide by zero rainfall
+
+        # CLIP TO KENYA BEFORE QUOTING ANY NATIONAL FIGURE.
+        # Rule E1 in the pre-launch checklist, and I broke it in run 78: the
+        # "712 mm normal" is the PADDED BOX mean, while etl_18 recorded
+        # Kenya-only as 681 mm. Every "% of Kenya" below was really "% of a
+        # box that includes ocean, Uganda, Tanzania, Ethiopia and Somalia".
+        # Same error as the flood layer, one hour after writing it down.
+        with engine.connect() as conn:
+            country = gpd.read_postgis("SELECT geom FROM admin.country",
+                                       conn, geom_col="geom")
+        if country.empty:
+            raise SystemExit("admin.country is empty; cannot clip.")
+        in_kenya = rasterize(
+            ((g, 1) for g in country.geometry if g is not None),
+            out_shape=(nh, nw), transform=ntransform, fill=0,
+            dtype="uint8", all_touched=True).astype(bool)
+        del country
+        print(f"   normal grid {nw} x {nh}")
+        print(f"   mean over the padded box : "
+              f"{np.nanmean(normal):.0f} mm")
+        print(f"   mean over KENYA ONLY     : "
+              f"{np.nanmean(np.where(in_kenya, normal, np.nan)):.0f} mm "
+              f"<- the honest denominator")
+
+        stack = []
+        used = []
+        for y, u in sorted(have.items()):
+            dest = RAW_DIR / Path(u).name
+            if not (dest.exists() and dest.stat().st_size > 100_000):
+                print(f"   {y} downloading ...", flush=True)
+                if not download(u, dest):
+                    print(f"      failed, skipping {y}")
+                    continue
+            with rasterio.open(dest) as src:
+                a = np.empty((nh, nw), dtype="float32")
+                reproject(source=rasterio.band(src, 1), destination=a,
+                          src_transform=src.transform, src_crs=src.crs,
+                          dst_transform=ntransform, dst_crs=ncrs,
+                          resampling=Resampling.bilinear,
+                          src_nodata=src.nodata, dst_nodata=np.nan)
+            # CHIRPS marks missing as -9999. REJECT, never clip.
+            a[a < 0] = np.nan
+            a[a > MAX_SANE_MM] = np.nan
+            stack.append(a)
+            used.append(y)
+            print(f"   {y}  Kenya-window mean {np.nanmean(a):>7.0f} mm")
+
+        if len(used) < MIN_YEARS:
+            raise SystemExit(f"Only {len(used)} usable year(s).")
+
+        arr = np.stack(stack)
+        recent = np.nanmean(arr, axis=0)
+        # THE MEAN HIDES THE THING THAT MATTERS.
+        # 2021-2025 contained the worst Horn of Africa drought in 40 years
+        # AND the 2023-24 floods. Averaged, Kenya reads "106% of normal",
+        # which is arithmetically true and a poor description of what anyone
+        # actually lived through. So the driest single year in the window is
+        # published alongside it: "in the worst of the last five years this
+        # area received 61% of normal" is a statement a buyer can plan around.
+        driest = np.nanmin(arr, axis=0)
+        del arr, stack
+
+        # -------------------------------------------------------------------
+        # 4. Anomaly as a percentage of the normal.
+        # -------------------------------------------------------------------
+        with np.errstate(invalid="ignore", divide="ignore"):
+            anom = 100.0 * recent / normal
+            worst = 100.0 * driest / normal
+        anom[~np.isfinite(anom)] = np.nan
+        worst[~np.isfinite(worst)] = np.nan
+        worst[(worst > 400) | (worst < 0)] = np.nan
+        # A ratio above 400% or below 10% is not a Kenyan rainfall anomaly,
+        # it is a grid or nodata problem. Rejected, and counted out loud.
+        wild = int(np.sum((anom > 400) | (anom < 10)))
+        if wild:
+            print(f"   note: {wild:,} cells outside 10-400% of normal "
+                  f"rejected as grid or nodata artefacts")
+            anom[(anom > 400) | (anom < 10)] = np.nan
+
+        def ken(a):
+            return np.where(in_kenya, a, np.nan)
+
+        print(f"\n3. Result over {len(used)} years {used}  (KENYA ONLY)")
+        print(f"   recent mean   : {np.nanmean(ken(recent)):>7.0f} mm "
+              f"(normal {np.nanmean(ken(normal)):.0f} mm)")
+        print(f"   mean anomaly  : {np.nanmean(ken(anom)):>7.1f}% of normal, "
+              f"median {np.nanmedian(ken(anom)):.1f}%")
+        ka = ken(anom)
+        fin = max(1, int(np.sum(np.isfinite(ka))))
+        print(f"   {100.0*np.nansum(ka < 90)/fin:.1f}% of Kenya below 90% "
+              f"of normal, {100.0*np.nansum(ka > 110)/fin:.1f}% above 110%")
+        kw = ken(worst)
+        fw = max(1, int(np.sum(np.isfinite(kw))))
+        print(f"\n   DRIEST YEAR in the window (what the mean hides):")
+        print(f"   mean {np.nanmean(kw):>5.1f}% of normal, "
+              f"median {np.nanmedian(kw):.1f}%")
+        print(f"   {100.0*np.nansum(kw < 75)/fw:.1f}% of Kenya had a year "
+              f"under 75% of normal; {100.0*np.nansum(kw < 50)/fw:.1f}% "
+              f"under 50%")
+
+        # -------------------------------------------------------------------
+        # 5. Write both COGs and catalogue them.
+        # -------------------------------------------------------------------
+        outs = [
+            ("rainfall_recent_mean",
+             f"climate_rainfall_recent_chirps_5km_{used[0]}-{used[-1]}.tif",
+             recent, "mm/yr",
+             f"CHIRPS v3.0 mean annual rainfall {used[0]}-{used[-1]} "
+             f"({len(used)} years), mm. RECENT CONDITIONS, not a climate "
+             f"normal: use climate.rainfall for climatology."),
+            ("rainfall_anomaly_pct",
+             f"climate_rainfall_anomaly_chirps_5km_{used[0]}-{used[-1]}.tif",
+             anom, "% of normal",
+             f"CHIRPS v3.0 {used[0]}-{used[-1]} mean as a PERCENTAGE of the "
+             f"1991-2020 normal. Below 100 = drier than usual. Percent of "
+             f"normal rather than a millimetre deficit, so arid and humid "
+             f"Kenya are comparable."),
+            ("rainfall_driest_year_pct",
+             f"climate_rainfall_driestyear_chirps_5km_{used[0]}-{used[-1]}.tif",
+             worst, "% of normal",
+             f"CHIRPS v3.0 DRIEST SINGLE YEAR of {used[0]}-{used[-1]} as a "
+             f"percentage of the 1991-2020 normal. Published because the "
+             f"multi-year mean conceals volatility: this window contained "
+             f"both the 2020-23 drought and the 2023-24 floods, which "
+             f"average to roughly normal. Use this for 'how bad does it get "
+             f"here', and the mean for 'what is it like on average'."),
+        ]
+        with engine.begin() as conn:
+            for variable, fname, data, unit, desc in outs:
+                cog = COG_DIR / fname
+                prof = dict(nprof)
+                prof.update(driver="GTiff", dtype="float32", count=1,
+                            nodata=NODATA, compress="DEFLATE", predictor=3,
+                            tiled=True, blockxsize=256, blockysize=256)
+                prof.pop("scales", None)
+                tmp = RAW_DIR / f"_tmp_{variable}.tif"
+                with rasterio.open(tmp, "w", **prof) as d:
+                    d.write(np.where(np.isfinite(data), data,
+                                     np.float32(NODATA)), 1)
+                if cog.exists():
+                    cog.unlink()
+                rio_copy(str(tmp), str(cog), driver="COG",
+                         compress="DEFLATE", predictor=3)
+                tmp.unlink(missing_ok=True)
+                with rasterio.open(cog) as s:
+                    b = s.bounds
+                    px = round(s.transform.a * 111320, 1)
+                print(f"   {cog.name}  ({cog.stat().st_size/1e6:.2f} MB, "
+                      f"{unit})")
+                conn.execute(text("""
+                    DELETE FROM metadata.raster_catalog
+                    WHERE dataset_id = :d AND variable = :v
+                """), {"d": dataset_id, "v": variable})
+                conn.execute(text("""
+                    INSERT INTO metadata.raster_catalog
+                        (dataset_id, name, variable, storage_url, format,
+                         pixel_size_m, band_count, nodata_value,
+                         temporal_start, temporal_end, bbox, checksum,
+                         source_id, source_date, confidence)
+                    VALUES (:d, :n, :v, :u, 'COG', :px, 1, :nod,
+                            make_date(:y0,1,1), make_date(:y1,12,31),
+                            ST_MakeEnvelope(:l,:bo,:r,:t,4326), :chk,
+                            (SELECT source_id FROM metadata.sources
+                             WHERE name ILIKE '%CHIRPS%' LIMIT 1),
+                            CURRENT_DATE, 3)
+                """), {"d": dataset_id, "n": desc, "v": variable,
+                       "u": str(cog), "px": px, "nod": NODATA,
+                       "y0": used[0], "y1": used[-1],
+                       "l": float(b.left), "bo": float(b.bottom),
+                       "r": float(b.right), "t": float(b.top),
+                       "chk": md5_of(cog)})
+
+            conn.execute(text("""
+                UPDATE metadata.etl_runs
+                SET finished_at=now(), run_status='success', rows_out=:n
+                WHERE run_id=:id
+            """), {"n": len(outs), "id": run_id})
+
+        print(f"\nDONE. Run {run_id} logged as success.")
+        print("USING THIS LAYER:")
+        print(" - climate.rainfall (1991-2020) is still the CLIMATOLOGY and")
+        print("   still the right input for 'can I farm here'. This does not")
+        print("   replace it.")
+        print(" - rainfall_anomaly_pct answers 'what has it been like")
+        print("   lately'. Below 100 means drier than usual.")
+        print(" - The underlying layer RUNS WET (~+145 mm vs 16 towns). The")
+        print("   ratio cancels much of that bias but not all of it: do not")
+        print("   quote anomaly to a precision it has not earned.")
+
+    except Exception as exc:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE metadata.etl_runs
+                SET finished_at=now(), run_status='failed', error_message=:e
+                WHERE run_id=:id
+            """), {"e": str(exc)[:2000], "id": run_id})
+        raise
+
+
+if __name__ == "__main__":
+    main()

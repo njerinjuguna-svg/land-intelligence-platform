@@ -1,0 +1,8 @@
+# The WIDGET's dependencies only - not the ETL's.
+# Pinned: an embed on a client's live site is not the place to discover that
+# a transitive upgrade changed behaviour overnight.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+python-dotenv==1.0.1

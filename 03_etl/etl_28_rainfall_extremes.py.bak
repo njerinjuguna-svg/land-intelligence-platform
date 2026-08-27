@@ -1,0 +1,444 @@
+r"""
+============================================================================
+ETL 28 - climate.rainfall EXTREMES (wettest 5-day periods)
+Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+WHY THIS EXISTS
+  hazards.flood currently answers "if water arrives, where does it go". It
+  has terrain, flow accumulation, catchment size and observed water. It has
+  NO measure of how much water arrives, so Budalangi (1,800 mm/yr) and a
+  Turkana floodplain (200 mm/yr) with identical HAND and identical catchment
+  get identical hazard. That is the single largest gap in the layer.
+
+  Annual TOTALS do not fill it. Flooding responds to INTENSITY: 900 mm
+  spread evenly over a year floods nothing, while 300 mm in five days floods
+  a catchment. So this measures the wettest 5-day period each year.
+
+WHY 5-DAY, AND WHY PENTAD DATA
+  Five days is the antecedent window that matters for RIVERINE flooding: it
+  is roughly how long a medium catchment takes to fill and route water to
+  its outlet. A single day's total mostly drives FLASH flooding, which is a
+  different mechanism our HAND-based layer is not modelling anyway.
+
+  CHIRPS publishes pentads (fixed 5-day blocks, 72 per year), which gives
+  5-day accumulation directly. Daily data would allow a ROLLING 5-day
+  maximum, which is strictly better, but needs ~365 files per year against
+  72 -- and on the connection that failed four different ways building
+  etl_25 and etl_26, five times the file count is five times the failure
+  surface.
+
+  HONEST LIMITATION OF FIXED PENTADS: a storm straddling a pentad boundary
+  is split between two blocks, so the fixed-pentad maximum UNDER-ESTIMATES
+  the true rolling 5-day maximum, by perhaps 10-20%. It is a consistent
+  under-estimate across the whole country, so it does not distort the
+  SPATIAL PATTERN, which is what a screening layer needs. Do not quote these
+  as design rainfall figures for engineering.
+
+WHAT IT PRODUCES
+  rainfall_max5day_mean   mean annual maximum 5-day rainfall, mm
+                          -> "a wet spell here typically delivers X mm"
+  rainfall_max5day_p90    90th percentile of the annual maxima, mm
+                          -> a rough 1-in-10-year wet spell. NOT a fitted
+                             return period: with ~15 years of record, an
+                             extreme-value fit would be a false precision.
+
+SOURCE, AND A VERSION MISMATCH WORTH KNOWING ABOUT
+  CHIRPS pentad, Climate Hazards Center, UC Santa Barbara. Public domain.
+  URL patterns are PROBED, not assumed -- and the probe found something:
+  **CHIRPS v3.0 publishes no pentad product.** Only v2.0 does. So the
+  extremes here are v2.0 while climate.rainfall's normal and recent layers
+  are v3.0.
+
+  v3 carries roughly twice the station observations over Africa, so the two
+  versions are not identical. This does NOT corrupt anything, because
+  nothing divides a v2 grid by a v3 one: the anomaly layer is v3/v3, and
+  these extremes stand alone. But it means an absolute v2 extreme and an
+  absolute v3 total are not strictly the same lineage, and CHC ends v2
+  production after December 2026. Re-probe for a v3 pentad or daily product
+  when that happens.
+
+How to run (from 03_etl with venv active):
+  python etl_28_rainfall_extremes.py --probe-only
+  python etl_28_rainfall_extremes.py
+============================================================================
+"""
+
+import os
+import sys
+import time
+import hashlib
+import urllib.request
+import urllib.error
+import http.client
+import warnings
+from pathlib import Path
+
+for _k in ("PROJ_LIB", "PROJ_DATA", "GDAL_DATA"):
+    os.environ.pop(_k, None)
+
+import numpy as np
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+try:
+    import rasterio
+    from rasterio.warp import reproject, Resampling
+    from rasterio.features import rasterize
+    from rasterio.shutil import copy as rio_copy
+except ImportError as e:
+    sys.exit(f"ERROR: missing dependency ({e}). pip install rasterio")
+
+try:
+    import geopandas as gpd
+except ImportError:
+    sys.exit("ERROR: geopandas missing. pip install geopandas")
+
+warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+warnings.filterwarnings("ignore", message="Mean of empty slice")
+
+BASE = Path(__file__).resolve().parent
+PROJECT = BASE.parent
+PIPELINE = "etl_28_rainfall_extremes"
+RAW_DIR = BASE / "data" / "raw" / "climate" / "pentad"
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+COG_DIR = PROJECT / "06_rasters" / "cog" / "climate"
+COG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Probed in order. {y} year, {m} month 01-12, {p} pentad-within-month 1-6.
+URL_PATTERNS = [
+    "https://data.chc.ucsb.edu/products/CHIRPS/v3.0/pentad/africa/tifs/"
+    "chirps-v3.0.{y}.{m:02d}.{p}.tif",
+    "https://data.chc.ucsb.edu/products/CHIRPS/v3.0/pentad/global/tifs/"
+    "chirps-v3.0.{y}.{m:02d}.{p}.tif",
+    "https://data.chc.ucsb.edu/products/CHIRPS-2.0/africa_pentad/tifs/"
+    "chirps-v2.0.{y}.{m:02d}.{p}.tif.gz",
+    "https://data.chc.ucsb.edu/products/CHIRPS-2.0/africa_pentad/tifs/"
+    "chirps-v2.0.{y}.{m:02d}.{p}.tif",
+    "https://data.chc.ucsb.edu/products/CHIRPS-2.0/global_pentad/tifs/"
+    "chirps-v2.0.{y}.{m:02d}.{p}.tif.gz",
+]
+
+YEARS = list(range(*[int(v) for v in os.getenv(
+    "EXTREME_YEARS", "2010,2026").split(",")]))     # 2010..2025 inclusive
+MIN_PENTADS = 60          # of 72; below this the annual maximum is unsafe
+MIN_YEARS = 8
+MAX_SANE_MM = 2000.0      # a 5-day total above this is not rainfall
+NODATA = -9999.0
+
+
+def md5_of(path, chunk=8 * 1024 * 1024):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(chunk), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def url_exists(url, timeout=40):
+    try:
+        req = urllib.request.Request(url, method="HEAD",
+                                     headers={"User-Agent": "LIP-ETL/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def download(url, dest, retries=4, timeout=120):
+    part = dest.with_suffix(dest.suffix + ".part")
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "LIP-ETL/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                exp = r.headers.get("Content-Length")
+                exp = int(exp) if exp and exp.isdigit() else None
+                got = 0
+                with open(part, "wb") as f:
+                    while True:
+                        c = r.read(1 << 20)
+                        if not c:
+                            break
+                        f.write(c)
+                        got += len(c)
+            if exp is not None and got != exp:
+                part.unlink(missing_ok=True)
+                time.sleep(2 * attempt)
+                continue
+            part.replace(dest)
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 404):
+                part.unlink(missing_ok=True)
+                return False
+        except (urllib.error.URLError, TimeoutError, OSError,
+                http.client.HTTPException):
+            pass
+        part.unlink(missing_ok=True)
+        time.sleep(3 * attempt)
+    return False
+
+
+def read_onto(path, dst_shape, dst_transform, dst_crs):
+    """Read a pentad tif (gz-aware) onto the reference grid."""
+    # /vsigzip/ reads the archive in place. Decompressing 1,152 pentads to
+    # disk would double the footprint and leave a second copy of everything
+    # lying around; GDAL can read the .gz directly. Same trick etl_26 uses
+    # to avoid unpacking an 11.6 GB global GeoTIFF.
+    src_path = (f"/vsigzip/{path.as_posix()}" if path.suffix == ".gz"
+                else str(path))
+    out = np.empty(dst_shape, dtype="float32")
+    with rasterio.open(src_path) as src:
+        reproject(source=rasterio.band(src, 1), destination=out,
+                  src_transform=src.transform, src_crs=src.crs,
+                  dst_transform=dst_transform, dst_crs=dst_crs,
+                  resampling=Resampling.bilinear,
+                  src_nodata=src.nodata, dst_nodata=np.nan)
+    out[out < 0] = np.nan                   # CHIRPS marks missing as -9999
+    out[out > MAX_SANE_MM] = np.nan         # reject, never clip
+    return out
+
+
+def main():
+    probe_only = "--probe-only" in sys.argv
+    load_dotenv(BASE / ".env")
+    pw = os.getenv("DB_PASSWORD")
+    if not pw or pw == "put_your_password_here":
+        sys.exit("ERROR: set DB_PASSWORD in .env first.")
+    url = (f"postgresql+psycopg2://{os.getenv('DB_USER','postgres')}:{pw}"
+           f"@{os.getenv('DB_HOST','localhost')}:{os.getenv('DB_PORT','5432')}"
+           f"/{os.getenv('DB_NAME','land_intelligence_kenya')}")
+    engine = create_engine(url)
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    print("Connected to database:",
+          os.getenv("DB_NAME", "land_intelligence_kenya"))
+
+    with engine.connect() as conn:
+        ref_path = conn.execute(text("""
+            SELECT storage_url FROM metadata.raster_catalog
+            WHERE variable = 'rainfall' AND status='active'
+            ORDER BY raster_id DESC LIMIT 1
+        """)).scalar()
+        dataset_id = conn.execute(text(
+            "SELECT dataset_id FROM metadata.datasets "
+            "WHERE code = 'climate.rainfall'")).scalar()
+    if not ref_path or not Path(ref_path).exists():
+        sys.exit("climate.rainfall normal not catalogued. Run etl_18 first: "
+                 "its grid is the reference every rainfall layer shares.")
+
+    print(f"\n1. Probing CHIRPS pentad ...")
+    pattern = None
+    for p in URL_PATTERNS:
+        test = p.format(y=YEARS[len(YEARS) // 2], m=1, p=1)
+        ok = url_exists(test)
+        print(f"   {'OK  ' if ok else 'no  '} {test}")
+        if ok:
+            pattern = p
+            break
+    if pattern is None:
+        sys.exit("No CHIRPS pentad pattern responded. Check "
+                 "https://data.chc.ucsb.edu/products/CHIRPS/ for the current "
+                 "layout and update URL_PATTERNS.")
+
+    n_files = len(YEARS) * 72
+    print(f"\n   {len(YEARS)} years x 72 pentads = {n_files:,} files")
+    print(f"   cached in {RAW_DIR}; a dropped connection costs one pentad,")
+    print(f"   not the run. Rerun after any failure and it resumes.")
+    if probe_only:
+        print("\n   --probe-only: stopping before any download.")
+        return
+
+    with engine.begin() as conn:
+        run_id = conn.execute(text("""
+            INSERT INTO metadata.etl_runs (pipeline, started_at, run_status)
+            VALUES (:p, now(), 'running') RETURNING run_id
+        """), {"p": PIPELINE}).scalar()
+    print(f"ETL run opened (run_id={run_id})")
+
+    try:
+        with rasterio.open(ref_path) as ref:
+            rprof = ref.profile.copy()
+            rtransform, rcrs = ref.transform, ref.crs
+            rw, rh = ref.width, ref.height
+        shape = (rh, rw)
+
+        with engine.connect() as conn:
+            country = gpd.read_postgis("SELECT geom FROM admin.country",
+                                       conn, geom_col="geom")
+        in_kenya = rasterize(
+            ((g, 1) for g in country.geometry if g is not None),
+            out_shape=shape, transform=rtransform, fill=0,
+            dtype="uint8", all_touched=True).astype(bool)
+        del country
+
+        # -------------------------------------------------------------------
+        # 2. One annual maximum per year, computed pentad by pentad so only
+        #    two grids are ever in memory.
+        # -------------------------------------------------------------------
+        print("\n2. Building annual maxima ...")
+        annual_max = {}
+        for y in YEARS:
+            ymax = np.full(shape, np.nan, dtype="float32")
+            got = 0
+            for m in range(1, 13):
+                for pp in range(1, 7):
+                    u = pattern.format(y=y, m=m, p=pp)
+                    dest = RAW_DIR / Path(u).name
+                    if not (dest.exists() and dest.stat().st_size > 1000):
+                        if not download(u, dest):
+                            continue
+                    try:
+                        a = read_onto(dest, shape, rtransform, rcrs)
+                    except Exception:
+                        continue
+                    ymax = np.fmax(ymax, a)     # fmax ignores NaN
+                    got += 1
+                    del a
+            if got < MIN_PENTADS:
+                print(f"   {y}  only {got}/72 pentads, YEAR REJECTED "
+                      f"(an annual maximum from a partial year is not one)")
+                continue
+            annual_max[y] = ymax
+            kv = ymax[in_kenya]
+            print(f"   {y}  {got}/72 pentads, Kenya max5day mean "
+                  f"{np.nanmean(kv):>6.1f} mm, max {np.nanmax(kv):>6.0f} mm",
+                  flush=True)
+
+        if len(annual_max) < MIN_YEARS:
+            raise SystemExit(f"Only {len(annual_max)} usable year(s); need "
+                             f"{MIN_YEARS} before an average maximum means "
+                             f"anything.")
+
+        used = sorted(annual_max)
+        stack = np.stack([annual_max[y] for y in used])
+        del annual_max
+        mean_max = np.nanmean(stack, axis=0)
+        p90_max = np.nanpercentile(stack, 90, axis=0)
+        del stack
+
+        def ken(a):
+            return np.where(in_kenya, a, np.nan)
+
+        print(f"\n3. Result over {len(used)} years {used[0]}-{used[-1]} "
+              f"(KENYA ONLY)")
+        print(f"   mean annual max 5-day : "
+              f"{np.nanmean(ken(mean_max)):>6.1f} mm "
+              f"(median {np.nanmedian(ken(mean_max)):.1f})")
+        print(f"   90th pct of maxima    : "
+              f"{np.nanmean(ken(p90_max)):>6.1f} mm")
+        km = ken(mean_max)
+        fin = max(1, int(np.sum(np.isfinite(km))))
+        print(f"   {100.0*np.nansum(km > 150)/fin:.1f}% of Kenya typically "
+              f"sees a 5-day spell over 150 mm")
+
+        # -------------------------------------------------------------------
+        # 3. Landmarks. Coast and highlands should dominate; the north should
+        #    not. Named before looking, per lesson 23.
+        # -------------------------------------------------------------------
+        SPOTS = [("Mombasa", 39.67, -4.04), ("Lamu", 40.90, -2.27),
+                 ("Kericho", 35.28, -0.37), ("Kakamega", 34.75, 0.28),
+                 ("Nairobi", 36.82, -1.29), ("Lodwar", 35.60, 3.12),
+                 ("Marsabit", 37.99, 2.33), ("Wajir", 40.06, 1.75)]
+        print("\n   typical wettest 5-day spell, by place")
+        with rasterio.open(ref_path) as ref:
+            for nm, lon, lat in SPOTS:
+                r, c = ref.index(lon, lat)
+                if 0 <= r < rh and 0 <= c < rw:
+                    print(f"     {nm:12}{float(mean_max[r, c]):>7.1f} mm")
+        print("   Coast and western highlands should lead; Lodwar, Marsabit")
+        print("   and Wajir should trail. If the north leads, the grid is")
+        print("   misaligned.")
+
+        # -------------------------------------------------------------------
+        # 4. Write and catalogue.
+        # -------------------------------------------------------------------
+        outs = [
+            ("rainfall_max5day_mean",
+             f"climate_rainfall_max5day_mean_chirps_5km_{used[0]}-{used[-1]}.tif",
+             mean_max,
+             f"CHIRPS mean annual maximum 5-day rainfall {used[0]}-{used[-1]}, "
+             f"mm. Flood-relevant INTENSITY, not annual total. From FIXED "
+             f"pentads, so a storm straddling a pentad boundary is split: "
+             f"this UNDER-estimates a true rolling 5-day maximum by roughly "
+             f"10-20%, consistently across the country. Not design rainfall. "
+             f"CHIRPS v2.0: v3.0 publishes no pentad product, so this layer "
+             f"is a different version from the v3.0 normal and recent "
+             f"totals. Nothing divides across versions."),
+            ("rainfall_max5day_p90",
+             f"climate_rainfall_max5day_p90_chirps_5km_{used[0]}-{used[-1]}.tif",
+             p90_max,
+             f"CHIRPS 90th percentile of annual maximum 5-day rainfall "
+             f"{used[0]}-{used[-1]}, mm. A rough 1-in-10-year wet spell. NOT "
+             f"a fitted return period: with {len(used)} years of record an "
+             f"extreme-value fit would be false precision."),
+        ]
+        print()
+        with engine.begin() as conn:
+            for variable, fname, data, desc in outs:
+                cog = COG_DIR / fname
+                prof = dict(rprof)
+                prof.update(driver="GTiff", dtype="float32", count=1,
+                            nodata=NODATA, compress="DEFLATE", predictor=3,
+                            tiled=True, blockxsize=256, blockysize=256)
+                prof.pop("scales", None)
+                tmp = RAW_DIR / f"_tmp_{variable}.tif"
+                with rasterio.open(tmp, "w", **prof) as d:
+                    d.write(np.where(np.isfinite(data), data,
+                                     np.float32(NODATA)), 1)
+                if cog.exists():
+                    cog.unlink()
+                rio_copy(str(tmp), str(cog), driver="COG",
+                         compress="DEFLATE", predictor=3)
+                tmp.unlink(missing_ok=True)
+                with rasterio.open(cog) as s:
+                    b = s.bounds
+                    px = round(s.transform.a * 111320, 1)
+                print(f"   {cog.name}  ({cog.stat().st_size/1e6:.2f} MB)")
+                conn.execute(text("""
+                    DELETE FROM metadata.raster_catalog
+                    WHERE dataset_id=:d AND variable=:v
+                """), {"d": dataset_id, "v": variable})
+                conn.execute(text("""
+                    INSERT INTO metadata.raster_catalog
+                        (dataset_id, name, variable, storage_url, format,
+                         pixel_size_m, band_count, nodata_value,
+                         temporal_start, temporal_end, bbox, checksum,
+                         source_id, source_date, confidence)
+                    VALUES (:d,:n,:v,:u,'COG',:px,1,:nod,
+                            make_date(:y0,1,1), make_date(:y1,12,31),
+                            ST_MakeEnvelope(:l,:bo,:r,:t,4326), :chk,
+                            (SELECT source_id FROM metadata.sources
+                             WHERE name ILIKE '%CHIRPS%' LIMIT 1),
+                            CURRENT_DATE, 3)
+                """), {"d": dataset_id, "n": desc, "v": variable,
+                       "u": str(cog), "px": px, "nod": NODATA,
+                       "y0": used[0], "y1": used[-1],
+                       "l": float(b.left), "bo": float(b.bottom),
+                       "r": float(b.right), "t": float(b.top),
+                       "chk": md5_of(cog)})
+            conn.execute(text("""
+                UPDATE metadata.etl_runs
+                SET finished_at=now(), run_status='success', rows_out=:n
+                WHERE run_id=:id
+            """), {"n": len(outs), "id": run_id})
+
+        print(f"\nDONE. Run {run_id} logged as success.")
+        print("NEXT USE: this is the missing forcing term for hazards.flood.")
+        print("HAND says where water goes; this says how much arrives. They")
+        print("should be combined as susceptibility x forcing, kept as two")
+        print("explainable numbers, NOT merged into one score with invented")
+        print("weights.")
+
+    except Exception as exc:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE metadata.etl_runs
+                SET finished_at=now(), run_status='failed', error_message=:e
+                WHERE run_id=:id
+            """), {"e": str(exc)[:2000], "id": run_id})
+        raise
+
+
+if __name__ == "__main__":
+    main()

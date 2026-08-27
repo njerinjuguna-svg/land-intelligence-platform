@@ -1,0 +1,280 @@
+"""
+============================================================================
+ETL 04 - LOAD THE DATA CATALOGUE INTO METADATA TABLES
+Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+What this script does, in order:
+  1. Connects to land_intelligence_kenya using your .env file
+  2. Opens a run record in metadata.etl_runs
+  3. Loads 02_data_catalogue/sources.csv into metadata.sources (upsert:
+     existing rows updated by name, new rows inserted)
+  4. Loads 02_data_catalogue/datasets.csv into metadata.datasets (upsert
+     by code), linking each dataset to its primary and backup source
+  5. Marks the datasets we have actually loaded so far as 'ingested'
+  6. Closes the run record with row counts
+
+After this, the database can answer questions like "which P1 datasets
+are still unloaded?" with a simple SQL query. The CSVs remain the
+editable master; rerun this script after any catalogue edit.
+
+How to run (from the 03_etl folder with the venv active):
+  python etl_04_load_catalogue.py
+
+Design notes:
+  * CSV 'yes'/'no' become true/false. Anything hedged ('caution',
+    'check each', 'share-alike conditions', 'internal') becomes NULL =
+    "not yet resolved", which is the honest answer until licensing
+    reviews conclude.
+  * The ETL-specific source rows registered by etl_01/02 (e.g.
+    'OpenStreetMap via Geofabrik (Kenya extract)') stay as row-level
+    provenance. The catalogue rows (e.g. 'OpenStreetMap') are the
+    organisation-level master list. Both levels are intentional.
+  * datasets.csv columns geometry_type/tier/format/license/
+    redistribution/api_available are not repeated in metadata.datasets:
+    they belong to the source or the target table itself.
+============================================================================
+"""
+
+import os
+import sys
+from pathlib import Path
+
+import pandas as pd
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+# ---------------------------------------------------------------------------
+# 0. SETTINGS
+# ---------------------------------------------------------------------------
+BASE = Path(__file__).resolve().parent
+CATALOGUE = BASE.parent / "02_data_catalogue"
+PIPELINE = "etl_04_load_catalogue"
+
+# Datasets already physically loaded (sessions 1 and 2) -> mark 'ingested'.
+INGESTED = [
+    "admin.counties", "admin.subcounties", "admin.wards",
+    "transport.roads", "environment.rivers", "environment.waterbodies",
+]
+
+
+def to_bool(v):
+    """'yes' -> True, 'no' -> False, anything hedged -> None (unresolved)."""
+    s = str(v).strip().lower()
+    if s == "yes":
+        return True
+    if s == "no":
+        return False
+    return None
+
+
+def to_none(v):
+    """Empty CSV cells arrive as NaN; the database wants NULL."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    s = str(v).strip()
+    return s if s and s.lower() not in ("none", "n/a", "nan") else None
+
+
+# ---------------------------------------------------------------------------
+# 1. CONNECT
+# ---------------------------------------------------------------------------
+load_dotenv(BASE / ".env")
+pw = os.getenv("DB_PASSWORD")
+if not pw or pw == "put_your_password_here":
+    sys.exit("ERROR: edit the .env file and set DB_PASSWORD first.")
+
+url = (
+    f"postgresql+psycopg2://{os.getenv('DB_USER', 'postgres')}:{pw}"
+    f"@{os.getenv('DB_HOST', 'localhost')}:{os.getenv('DB_PORT', '5432')}"
+    f"/{os.getenv('DB_NAME', 'land_intelligence_kenya')}"
+)
+engine = create_engine(url)
+with engine.connect() as conn:
+    conn.execute(text("SELECT 1"))
+print("Connected to database:", os.getenv("DB_NAME", "land_intelligence_kenya"))
+
+# ---------------------------------------------------------------------------
+# 2. OPEN AN ETL RUN RECORD
+# ---------------------------------------------------------------------------
+with engine.begin() as conn:
+    run_id = conn.execute(
+        text("""
+            INSERT INTO metadata.etl_runs (pipeline, started_at, run_status)
+            VALUES (:p, now(), 'running') RETURNING run_id
+        """),
+        {"p": PIPELINE},
+    ).scalar()
+print(f"ETL run opened (run_id={run_id})")
+
+rows_total = 0
+try:
+    # -----------------------------------------------------------------------
+    # 3. SOURCES
+    # -----------------------------------------------------------------------
+    src_csv = CATALOGUE / "sources.csv"
+    df = pd.read_csv(src_csv)
+    print(f"\nLoading {len(df)} sources from {src_csv.name}...")
+
+    with engine.begin() as conn:
+        for _, r in df.iterrows():
+            conn.execute(text("""
+                INSERT INTO metadata.sources
+                    (name, organisation, tier, url, license,
+                     redistribution_allowed, api_available, notes)
+                VALUES (:name, :org, :tier, :url, :lic, :redis, :api, :notes)
+                ON CONFLICT (name) DO UPDATE SET
+                    organisation = EXCLUDED.organisation,
+                    tier = EXCLUDED.tier,
+                    url = EXCLUDED.url,
+                    license = EXCLUDED.license,
+                    redistribution_allowed = EXCLUDED.redistribution_allowed,
+                    api_available = EXCLUDED.api_available,
+                    notes = EXCLUDED.notes,
+                    updated_at = now()
+            """), {
+                "name": r["name"].strip(),
+                "org": to_none(r["organisation"]),
+                "tier": int(r["tier"]),
+                "url": to_none(r["url"]),
+                "lic": to_none(r["license"]),
+                "redis": to_bool(r["redistribution_allowed"]),
+                "api": to_bool(r["api_available"]),
+                "notes": to_none(r["notes"]),
+            })
+    rows_total += len(df)
+    print(f"   {len(df)} sources upserted into metadata.sources")
+
+    # Name -> source_id lookup for the datasets step.
+    with engine.connect() as conn:
+        id_by_name = dict(conn.execute(
+            text("SELECT name, source_id FROM metadata.sources")).fetchall())
+
+    # -----------------------------------------------------------------------
+    # 4. DATASETS
+    # -----------------------------------------------------------------------
+    ds_csv = CATALOGUE / "datasets.csv"
+    df = pd.read_csv(ds_csv)
+    print(f"\nLoading {len(df)} datasets from {ds_csv.name}...")
+
+    # VALIDATE BEFORE LOADING. A CSV row with a missing field shifts every
+    # later value into the wrong column. Constrained columns are our canary:
+    # if coverage/priority/etl_status hold anything unexpected, the row is
+    # malformed. Fail loudly, name the rows, touch nothing.
+    VALID_COVERAGE = {"national", "pilot_counties", "partial", "global"}
+    VALID_PRIORITY = {"P1", "P2", "P3"}
+    VALID_STATUS = {"planned", "sourced", "ingested", "validated",
+                    "published", "deprecated"}
+    bad = []
+    for _, r in df.iterrows():
+        problems = []
+        if str(r["coverage"]).strip() not in VALID_COVERAGE:
+            problems.append(f"coverage={r['coverage']!r}")
+        if str(r["priority"]).strip() not in VALID_PRIORITY:
+            problems.append(f"priority={r['priority']!r}")
+        if str(r["etl_status"]).strip() not in VALID_STATUS:
+            problems.append(f"etl_status={r['etl_status']!r}")
+        if problems:
+            bad.append(f"  {r['code']}: {', '.join(problems)}")
+    if bad:
+        raise RuntimeError(
+            "datasets.csv has malformed rows (likely a missing field "
+            "shifting values into the wrong columns). Fix these rows and "
+            "rerun:\n" + "\n".join(bad))
+    print("   All rows validated against schema constraints")
+
+    missing = set()
+    with engine.begin() as conn:
+        for _, r in df.iterrows():
+            primary = to_none(r["primary_source"])
+            backup = to_none(r["backup_source"])
+            sid = id_by_name.get(primary)
+            bid = id_by_name.get(backup)
+            if primary and sid is None:
+                missing.add(primary)
+            if backup and bid is None:
+                missing.add(backup)
+            conn.execute(text("""
+                INSERT INTO metadata.datasets
+                    (code, name, category, description, buyer_question,
+                     source_id, backup_source_id, storage, target_table,
+                     native_crs, resolution, update_frequency,
+                     coverage, priority, etl_status)
+                VALUES
+                    (:code, :name, :cat, :descr, :bq,
+                     :sid, :bid, :storage, :tgt,
+                     :crs, :res, :freq,
+                     :cov, :prio, :status)
+                ON CONFLICT (code) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    category = EXCLUDED.category,
+                    description = EXCLUDED.description,
+                    buyer_question = EXCLUDED.buyer_question,
+                    source_id = EXCLUDED.source_id,
+                    backup_source_id = EXCLUDED.backup_source_id,
+                    storage = EXCLUDED.storage,
+                    target_table = EXCLUDED.target_table,
+                    native_crs = EXCLUDED.native_crs,
+                    resolution = EXCLUDED.resolution,
+                    update_frequency = EXCLUDED.update_frequency,
+                    coverage = EXCLUDED.coverage,
+                    priority = EXCLUDED.priority,
+                    updated_at = now()
+                    -- etl_status deliberately NOT overwritten on update:
+                    -- the database's live status outranks the CSV's 'planned'
+            """), {
+                "code": r["code"].strip(),
+                "name": r["name"].strip(),
+                "cat": r["category"].strip(),
+                "descr": to_none(r["notes"]),
+                "bq": to_none(r["buyer_question"]),
+                "sid": sid,
+                "bid": bid,
+                "storage": r["storage"].strip(),
+                "tgt": to_none(r["target_table"]),
+                "crs": to_none(r["native_crs"]),
+                "res": to_none(r["resolution"]),
+                "freq": to_none(r["update_frequency"]),
+                "cov": r["coverage"].strip(),
+                "prio": r["priority"].strip(),
+                "status": to_none(r["etl_status"]) or "planned",
+            })
+    rows_total += len(df)
+    print(f"   {len(df)} datasets upserted into metadata.datasets")
+    if missing:
+        print(f"   WARNING: these source names in datasets.csv have no row "
+              f"in sources.csv (source_id left NULL): {sorted(missing)}")
+
+    # -----------------------------------------------------------------------
+    # 5. MARK WHAT IS ALREADY LOADED
+    # -----------------------------------------------------------------------
+    with engine.begin() as conn:
+        n = conn.execute(text("""
+            UPDATE metadata.datasets
+            SET etl_status = 'ingested', updated_at = now()
+            WHERE code = ANY(:codes) AND etl_status = 'planned'
+        """), {"codes": INGESTED}).rowcount
+    print(f"\n   {n} datasets marked as 'ingested' "
+          "(admin boundaries, roads, rivers, waterbodies)")
+
+    # -----------------------------------------------------------------------
+    # 6. CLOSE THE RUN RECORD AS SUCCESS
+    # -----------------------------------------------------------------------
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'success', rows_out = :r
+            WHERE run_id = :id
+        """), {"r": rows_total, "id": run_id})
+    print(f"\nDONE. {rows_total} rows loaded. Run {run_id} logged as success.")
+    print("Try this in pgAdmin, your database now describes itself:")
+    print("  SELECT priority, etl_status, count(*) FROM metadata.datasets")
+    print("  GROUP BY 1, 2 ORDER BY 1, 2;")
+
+except Exception as exc:
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'failed', error_message = :e
+            WHERE run_id = :id
+        """), {"e": str(exc)[:2000], "id": run_id})
+    raise

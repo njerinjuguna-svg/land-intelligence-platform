@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Land report — what you need to know</title>
+<style>
+  :root{
+    color-scheme:dark;
+    --plane:#0d0d0d;--surface:#1a1a19;--surface-2:#232322;--line:#33322f;
+    --ink:#fff;--ink-2:#c3c2b7;--ink-3:#8b8a80;
+    --yes:#0ca30c;--careful:#fab219;--no:#d03b3b;--unsure:#8b8a80;--accent:#3987e5;
+  }
+  :root[data-theme="light"]{
+    color-scheme:light;
+    --plane:#f9f9f7;--surface:#fcfcfb;--surface-2:#f1f1ee;--line:#dedcd5;
+    --ink:#0b0b0b;--ink-2:#52514e;--ink-3:#6e6d67;
+    --yes:#0ca30c;--careful:#fab219;--no:#d03b3b;--unsure:#6e6d67;--accent:#2a78d6;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--plane);color:var(--ink);
+    font:16px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:760px;margin:0 auto;padding:18px 20px 70px}
+  .top{display:flex;gap:10px;align-items:center;padding-bottom:16px;
+    border-bottom:1px solid var(--line);margin-bottom:24px}
+  .logo{width:24px;height:24px;border-radius:7px;
+    background:linear-gradient(135deg,#3987e5,#199e70)}
+  .logo+b{font-weight:650}
+  .sp{flex:1}
+  select,button{font:inherit;font-size:14px;color:var(--ink);background:var(--surface-2);
+    border:1px solid var(--line);border-radius:8px;padding:7px 10px;cursor:pointer}
+
+  h1{font-size:30px;margin:0 0 6px;letter-spacing:-.02em}
+  .where{color:var(--ink-2);margin:0 0 4px}
+  .size{color:var(--ink-3);font-size:14px;margin:0}
+
+  .headline{margin:26px 0 6px;padding:20px 22px;border-radius:14px;
+    background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--hc)}
+  .headline .big{font-size:22px;font-weight:640;letter-spacing:-.015em;margin-bottom:6px;
+    display:flex;gap:10px;align-items:center}
+  .headline .big svg{width:22px;height:22px;flex:none;color:var(--hc)}
+  .headline p{margin:0;color:var(--ink-2);font-size:15.5px}
+
+  h2{font-size:19px;margin:36px 0 14px;letter-spacing:-.01em}
+
+  .q{background:var(--surface);border:1px solid var(--line);border-radius:14px;
+    padding:18px 20px;margin-bottom:12px}
+  .q .ask{font-size:17px;font-weight:620;margin-bottom:12px}
+  .q .ans{display:flex;gap:10px;align-items:flex-start;margin-bottom:10px}
+  .q .ans svg{width:21px;height:21px;flex:none;margin-top:2px;color:var(--ac)}
+  .q .ans b{font-size:17px;color:var(--ac);font-weight:640}
+  .q .say{margin:0;font-size:15.5px;color:var(--ink-2)}
+  .means{margin-top:13px;padding:13px 15px;border-radius:10px;background:var(--surface-2);
+    font-size:15px}
+  .means b{display:block;margin-bottom:3px;font-size:13px;color:var(--ink-3);
+    text-transform:uppercase;letter-spacing:.07em;font-weight:600}
+  .sure{margin-top:11px;font-size:13.5px;color:var(--ink-3)}
+
+  .warnbox{margin:24px 0;padding:18px 20px;border-radius:14px;
+    border:1px solid var(--no);background:color-mix(in srgb,var(--no) 12%,var(--surface))}
+  .warnbox.hide{display:none}
+  .warnbox b{display:block;font-size:17px;margin-bottom:7px}
+  .warnbox p{margin:0;color:var(--ink-2);font-size:15.5px}
+
+  .near{background:var(--surface);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+  .near div.n{display:flex;justify-content:space-between;gap:14px;align-items:baseline;
+    padding:12px 20px;border-bottom:1px solid var(--line)}
+  .near div.n:last-child{border-bottom:0}
+  .near .what{font-size:15.5px}
+  .near .how{color:var(--ink-2);font-size:15px;text-align:right;white-space:nowrap}
+  .near .how i{display:block;font-style:normal;font-size:12.5px;color:var(--ink-3)}
+  .onland{padding:13px 20px;background:var(--surface-2);font-size:15px;
+    border-bottom:1px solid var(--line)}
+  .onland b{color:var(--ink)}
+
+  ol.check{margin:0;padding:0;list-style:none;counter-reset:c}
+  ol.check li{counter-increment:c;position:relative;padding:13px 20px 13px 56px;
+    background:var(--surface);border:1px solid var(--line);border-radius:12px;
+    margin-bottom:9px;font-size:15.5px}
+  ol.check li::before{content:counter(c);position:absolute;left:19px;top:13px;
+    width:24px;height:24px;border-radius:50%;background:var(--accent);color:#fff;
+    font-size:13px;font-weight:640;display:grid;place-items:center}
+  ol.check li span{display:block;color:var(--ink-3);font-size:13.5px;margin-top:2px}
+
+  .plain{background:var(--surface-2);border-radius:12px;padding:16px 18px;
+    font-size:14.5px;color:var(--ink-2);margin-top:22px}
+  .plain b{color:var(--ink)}
+  footer{margin-top:30px;padding-top:16px;border-top:1px solid var(--line);
+    font-size:12.5px;color:var(--ink-3);line-height:1.7}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="top">
+    <div class="logo"></div><b>Geocode</b>
+    <div class="sp"></div>
+    <select id="pick"></select>
+    <button id="theme">Light</button>
+  </div>
+
+  <h1 id="ref">—</h1>
+  <p class="where" id="where">—</p>
+  <p class="size" id="size">—</p>
+
+  <div class="warnbox hide" id="warn"><b id="warnT"></b><p id="warnB"></p></div>
+
+  <div class="headline" id="headline">
+    <div class="big" id="headBig"></div>
+    <p id="headP"></p>
+  </div>
+
+  <h2>The four things people ask</h2>
+  <div id="qs"></div>
+
+  <h2>What's nearby</h2>
+  <div class="near" id="near"></div>
+
+  <h2 id="checkH">Before you pay</h2>
+  <ol class="check" id="check"></ol>
+
+  <div class="plain">
+    <b>How we worked this out.</b> We measured this plot against satellite images,
+    rainfall records, soil maps and government data. Nobody from our team has stood
+    on this land. <b>Always visit the plot and use a lawyer and a surveyor before you
+    pay any money.</b> This report does not confirm who owns the land or where its
+    legal boundary runs.
+  </div>
+
+  <footer>
+    Geocode Spatial Solutions Ltd · Report generated from data current to 2024.<br>
+    Map data © OpenStreetMap contributors. Terrain from Copernicus. Rainfall from CHIRPS.
+  </footer>
+</div>
+
+<script>
+// Real values from enrichment run de64a830 (2026-08-20), translated into
+// what they mean. Nothing invented.
+const IC={
+ yes:'<path d="M20 6 9 17l-5-5"/>',
+ careful:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>',
+ no:'<circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/>',
+ unsure:'<circle cx="12" cy="12" r="9"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01"/>'};
+
+function travel(m){
+  if(m===0) return {t:'On the plot itself',s:''};
+  if(m<1600){const w=Math.round(m/80);return {t:w+' min walk',s:m<1000?m+' m away':(m/1000).toFixed(1)+' km away'};}
+  const d=Math.round(m/1000/40*60);
+  return {t:(d<1?1:d)+' min drive',s:(m/1000).toFixed(1)+' km away'};
+}
+const SURE={4:"We're confident about this.",3:"We're fairly confident about this.",
+            2:"Treat this as a rough guide.",1:"We can't be sure — see below."};
+
+const P={
+'TEST-KAREN-01':{
+ where:'Karen, Nairobi', size:'2 acres (0.8 hectares)',
+ head:{c:'yes',t:'A good plot to build on',
+   p:'It is dry, flat, close to a road and well served. The one thing we cannot check from here is the soil under it.'},
+ build:{c:'yes',t:'Yes',
+   say:'The land is flat and we found no flooding risk and no river reserve on it.',
+   means:'You can build here. Get a soil test anyway — see the checklist.',sure:3},
+ farm:{c:'yes',t:'Yes, for most crops',
+   say:'Rain is reliable — about 950 mm a year, which is enough for maize without irrigation.',
+   means:'Good for a kitchen garden, fruit trees or a small shamba. Not big-scale farming land.',sure:3},
+ flood:{c:'yes',t:'No flooding expected',
+   say:'The whole plot sits on high, dry ground and the area around it is drier than most of Kenya.',
+   means:'Flooding is not a concern here.',sure:3},
+ grow:{c:'yes',t:'Yes, and quickly',
+   say:'Lights at night in this area have been increasing fast, which is what happens when people build.',
+   means:'This is an area on the way up. Prices here are more likely to rise than fall.',sure:3},
+ near:[['Main road',0],['Tarmac road',511],['Mobile network mast',45],['Primary school',741],
+       ['Secondary school',840],['Clinic',2489],['Hospital',3088],['River',625]],
+ check:[['Get a soil test before you design the foundation',
+   'We could not tell whether this is black cotton soil. On flat land near Nairobi that is a real possibility, and it changes what the foundation costs.'],
+   ['Confirm the boundary with a surveyor','Our measurements are from maps, not from beacons on the ground.'],
+   ['Check the title at the Lands office','We do not check ownership.']]},
+
+'TEST-ATHIPLAINS-01':{
+ where:'Athi-Kapiti plains, Machakos', size:'10 acres (4 hectares)',
+ head:{c:'careful',t:'Buildable, but check the soil first',
+   p:'The land itself is fine. What we cannot tell you is whether it sits on black cotton soil — and on these plains that decides your building cost.'},
+ build:{c:'unsure',t:"We can't tell you yet",
+   say:'The soil maps we use read this ground as ordinary clay loam. But these plains are known for black cotton soil, and our data cannot tell the two apart here.',
+   means:'Do not budget for the foundation until a soil test is done. Black cotton can add a lot to the cost of building.',sure:1},
+ farm:{c:'careful',t:'Only with water',
+   say:'Rain is low — about 590 mm a year, and in the driest years it drops by a fifth.',
+   means:'You would need a borehole or dam for anything beyond drought-hardy crops or grazing.',sure:3},
+ flood:{c:'careful',t:'Mostly fine, one part is not',
+   say:'Most of the plot is on safe ground. A small corner sits lower and could take water in heavy rain.',
+   means:'Do not put the house on the low corner. Walk the plot after heavy rain if you can.',sure:3},
+ grow:{c:'yes',t:'Yes, quickly',
+   say:'Night-time lights in this area are rising fast — a sign of new building nearby.',
+   means:'This area is developing. That usually shows up in land prices.',sure:3},
+ near:[['Main road',553],['Mobile network mast',559],['River',161],['Tarmac road',3155],
+       ['Primary school',3200],['Secondary school',4357],['Clinic',6106],['Hospital',6106],
+       ['Water point',7062]],
+ check:[['Get a soil test. This is the important one.',
+   'Ask for a test that says whether the soil is expansive or black cotton. Do it before you agree a building budget.'],
+   ['Ask a builder to price the foundation both ways','So a bad soil result does not surprise you after you have paid.'],
+   ['Find out where water will come from','There is no mapped water point within 7 km.'],
+   ['Confirm the boundary with a surveyor','Our measurements are from maps, not beacons.']]},
+
+'TEST-KANO-01':{
+ where:'Kano plains, Kisumu', size:'10 acres (4 hectares)',
+ head:{c:'careful',t:'Excellent farmland. Not a place to build a house.',
+   p:'This is some of the best growing land we have measured. It also floods, and part of it falls in a river reserve.'},
+ build:{c:'no',t:'Not recommended',
+   say:'Part of this plot is inside a river reserve, which by law you cannot build on, and the ground floods.',
+   means:'Buy this to farm, not to live on. If you must build, put it well away from the river and expect to raise the floor level.',sure:3},
+ farm:{c:'yes',t:'Yes — this is very good farmland',
+   say:'Heavy, reliable rain of around 1,560 mm a year, flat ground and rich clay soil.',
+   means:'This is proper farming land. The same flooding that makes it bad to build on is what makes the soil good.',sure:3},
+ flood:{c:'no',t:'Yes, it floods',
+   say:'Half of this plot is in the highest flood category, and the land all around it is the same.',
+   means:'Expect water on this land in a heavy season. Plan for it rather than against it.',sure:3},
+ grow:{c:'careful',t:'Slowly',
+   say:'There is some increase in night-time lights, but nothing like the areas around the big towns.',
+   means:'Buy this for what it produces, not for a quick rise in price.',sure:3},
+ near:[['River',0],['Main road',41],['Primary school',530],['Tarmac road',556],
+       ['Secondary school',606],['Mobile network mast',369],['Water point',1339],
+       ['Clinic',3916],['Hospital',4721]],
+ check:[['Ask the county exactly where the river reserve runs',
+   'You cannot build inside it. A surveyor can mark it on the ground.'],
+   ['Ask neighbours how high the water came in the last big rains','They will know better than any map.'],
+   ['Check the title at the Lands office','We do not check ownership.']]},
+
+'TEST-TANADELTA-01':{
+ where:'Tana delta, Tana River', size:'50 acres (20 hectares)',
+ head:{c:'no',t:'Do not buy this plot',
+   p:'It falls inside a protected area. Land inside one normally cannot be sold or built on at all.'},
+ build:{c:'no',t:'No',
+   say:'This land sits inside a gazetted protected area, and part of it is also in a river reserve.',
+   means:'Walk away unless the seller can show you written proof from the authorities that this land can be sold.',sure:2},
+ farm:{c:'no',t:'No',
+   say:'The same protection applies. It also floods badly.',
+   means:'Not farmland you can legally use.',sure:2},
+ flood:{c:'no',t:'Yes, badly',
+   say:'A large part of this plot is in the highest flood category and a river runs through it.',
+   means:'This is floodplain.',sure:3},
+ grow:{c:'careful',t:'No',
+   say:'Almost no change in night-time lights. Very few people live nearby.',
+   means:'Remote land with no sign of development.',sure:3},
+ near:[['River',0],['Primary school',0],['Main road',38],['Mobile network mast',1198],
+       ['Clinic',7939],['Secondary school',14140],['Tarmac road',15817],['Hospital',23826]],
+ check:[['Ask the seller for written proof this land can legally be sold',
+   'Our data shows it inside a protected area. Do not pay a deposit before you see this.'],
+   ['Verify with the Lands office and the county','Independently of whatever the seller shows you.'],
+   ['If in doubt, walk away','There is plenty of land that does not carry this question.']]},
+
+'PLOT-950':{
+ where:'OAK GROVE scheme', size:'Between 2 and 8.5 acres — see below',
+ withheld:{t:'We cannot report on this plot yet',
+   b:'The plot boundary we were given does not close properly, and when we corrected it the size jumped from 2 acres to 8.5 acres. Everything we measure depends on knowing exactly where the plot is, and right now we do not. Ask the seller for the mutation drawing and we will have your report within a day.'},
+ near:[['River',0],['Main road',74],['Primary school',1011],['Water point',1074],
+       ['Mobile network mast',1504],['Clinic',1626],['Secondary school',2242],['Tarmac road',2869]],
+ check:[['Ask the seller for the mutation drawing',
+   'This is the surveyed drawing showing the plot boundary. Without it nobody can tell you what you are buying.'],
+   ['Do not pay a deposit until the size is confirmed','The difference here is over 6 acres.'],
+   ['Ask the surveyor to mark the beacons','So you can see the corners on the ground.']]}
+};
+
+function qcard(ask,d){
+  return '<div class="q" style="--ac:var(--'+d.c+')"><div class="ask">'+ask+'</div>'+
+   '<div class="ans"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '+
+   'stroke-linecap="round" stroke-linejoin="round">'+IC[d.c]+'</svg><b>'+d.t+'</b></div>'+
+   '<p class="say">'+d.say+'</p>'+
+   '<div class="means"><b>What this means for you</b>'+d.means+'</div>'+
+   '<div class="sure">'+SURE[d.sure]+'</div></div>';
+}
+
+function render(k){
+  const p=P[k];
+  document.getElementById('ref').textContent=k;
+  document.getElementById('where').textContent=p.where;
+  document.getElementById('size').textContent=p.size;
+
+  const w=document.getElementById('warn');
+  if(p.withheld){w.classList.remove('hide');
+    document.getElementById('warnT').textContent=p.withheld.t;
+    document.getElementById('warnB').textContent=p.withheld.b;
+    document.getElementById('headline').style.display='none';
+    document.getElementById('qs').innerHTML='';
+    document.querySelector('h2').style.display='none';
+  }else{
+    w.classList.add('hide');
+    document.getElementById('headline').style.display='';
+    document.querySelector('h2').style.display='';
+    document.getElementById('headline').style.setProperty('--hc','var(--'+p.head.c+')');
+    document.getElementById('headBig').innerHTML=
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '+
+      'stroke-linecap="round" stroke-linejoin="round">'+IC[p.head.c]+'</svg>'+p.head.t;
+    document.getElementById('headP').textContent=p.head.p;
+    document.getElementById('qs').innerHTML=
+      qcard('Can I build a house here?',p.build)+
+      qcard('Can I farm it?',p.farm)+
+      qcard('Will it flood?',p.flood)+
+      qcard('Is this area growing?',p.grow);
+  }
+
+  const onLand=p.near.filter(([,m])=>m===0).map(([w])=>w.toLowerCase());
+  const rest=p.near.filter(([,m])=>m>0).sort((a,b)=>a[1]-b[1]);
+  document.getElementById('near').innerHTML=
+    (onLand.length?'<div class="onland"><b>On the plot itself:</b> '+onLand.join(', ')+
+      '. Not nearby — actually on the land.</div>':'')+
+    rest.map(([w,m])=>{const t=travel(m);
+      return '<div class="n"><span class="what">'+w+'</span>'+
+        '<span class="how">'+t.t+'<i>'+t.s+'</i></span></div>';}).join('');
+
+  document.getElementById('check').innerHTML=p.check.map(([t,s])=>
+    '<li>'+t+'<span>'+s+'</span></li>').join('');
+}
+
+const s=document.getElementById('pick');
+s.innerHTML=Object.keys(P).map(k=>'<option>'+k+'</option>').join('');
+s.onchange=e=>render(e.target.value);
+document.getElementById('theme').onclick=function(){
+  const d=document.documentElement.getAttribute('data-theme')==='dark';
+  document.documentElement.setAttribute('data-theme',d?'light':'dark');
+  this.textContent=d?'Dark':'Light';};
+render('TEST-KAREN-01');
+</script>
+</body>
+</html>

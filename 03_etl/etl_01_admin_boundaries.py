@@ -1,0 +1,329 @@
+"""
+============================================================================
+ETL 01 - ADMINISTRATIVE BOUNDARIES
+Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+What this script does, in order:
+  1. Connects to the land_intelligence_kenya database using your .env file
+  2. Registers the data source in metadata.sources (nothing enters anonymously)
+  3. Opens a run record in metadata.etl_runs (so every load is logged)
+  4. Reads the county / subcounty / ward shapefiles you downloaded
+  5. Cleans them: converts to EPSG:4326, repairs broken geometries,
+     matches county names to the official codes already seeded in the DB
+  6. Stages them in a scratch schema called "staging" (the loading dock)
+  7. Moves them into the real admin tables with proper provenance columns
+  8. Closes the run record with row counts
+
+How to run (from the 03_etl folder with the venv active):
+  python etl_01_admin_boundaries.py
+
+Expected input files (place them under 03_etl/data/raw/, any subfolder):
+  * A counties shapefile     (name contains 'adm1' or 'count')
+  * A subcounties shapefile  (name contains 'adm2' or 'subcount')  [optional]
+  * A wards shapefile        (name contains 'ward')                [optional]
+============================================================================
+"""
+
+import os
+import re
+import sys
+from datetime import date
+from pathlib import Path
+
+import geopandas as gpd
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+# ---------------------------------------------------------------------------
+# 0. SETTINGS
+# ---------------------------------------------------------------------------
+BASE = Path(__file__).resolve().parent
+RAW = BASE / "data" / "raw"
+
+SOURCE_NAME = "HDX COD-AB Kenya (OCHA/IEBC)"
+SOURCE_URL = "https://data.humdata.org/dataset/cod-ab-ken"
+SOURCE_DATE = date.today()          # when we fetched it; edit if you know better
+PIPELINE = "etl_01_admin_boundaries"
+
+# Candidate attribute-column names, because every shapefile publisher
+# names their columns differently. First match wins.
+COUNTY_NAME_COLS = ["ADM1_NAME", "ADM1_EN", "COUNTY_NAM", "COUNTY", "NAME_1",
+                    "COUNTY_N", "NAME"]
+SUBCOUNTY_NAME_COLS = ["ADM2_NAME", "ADM2_EN", "SUBCOUNTY", "SUB_COUNTY",
+                       "NAME_2", "NAME"]
+WARD_NAME_COLS = ["ADM3_NAME", "ADM3_EN", "IEBC_WARDS", "WARD", "WARD_NAME",
+                  "NAME_3", "NAME"]
+# PCODE removed: in this file it is NOT unique per ward, so it cannot be a
+# ward identifier. Better a NULL code than a wrong one.
+WARD_CODE_COLS = ["ADM3_PCODE", "WARD_CODE", "CODE", "UID"]
+
+# County name spellings that differ between publishers and our seed table.
+# Left side: normalised publisher spelling. Right side: our official name.
+ALIASES = {
+    "NAIROBICITY": "NAIROBI",
+    "THARAKA": "THARAKANITHI",
+    "ELGEYOMARAKWET": "ELGEYOMARAKWET",
+    "MURANGA": "MURANGA",
+    "TRANSNZOIA": "TRANSNZOIA",
+}
+
+
+def norm(name: str) -> str:
+    """Normalise a name for matching: uppercase, letters only.
+    'Murang'a' -> 'MURANGA', 'Elgeyo-Marakwet' -> 'ELGEYOMARAKWET'.
+    This is how we survive the fact that three publishers spell
+    one county four different ways."""
+    return re.sub(r"[^A-Z]", "", str(name).upper())
+
+
+def find_shapefile(keywords):
+    """Search data/raw recursively for the first .shp whose filename
+    contains any of the given keywords."""
+    for shp in sorted(RAW.rglob("*.shp")):
+        low = shp.name.lower()
+        if any(k in low for k in keywords):
+            return shp
+    return None
+
+
+def pick_column(gdf, candidates):
+    """Return the first candidate column that exists in the file
+    (case-insensitive), else None."""
+    lookup = {c.upper(): c for c in gdf.columns}
+    for cand in candidates:
+        if cand.upper() in lookup:
+            return lookup[cand.upper()]
+    return None
+
+
+def clean(gdf):
+    """Make every geometry valid and every CRS EPSG:4326.
+    Shapefiles often carry tiny self-intersections; buffer(0) style repair
+    happens later in SQL with ST_MakeValid. Here we just fix the CRS."""
+    if gdf.crs is None:
+        print("   WARNING: file has no CRS declared, assuming EPSG:4326")
+        gdf = gdf.set_crs(4326)
+    elif gdf.crs.to_epsg() != 4326:
+        print(f"   Reprojecting from {gdf.crs} to EPSG:4326")
+        gdf = gdf.to_crs(4326)
+    return gdf
+
+
+# ---------------------------------------------------------------------------
+# 1. CONNECT
+# ---------------------------------------------------------------------------
+load_dotenv(BASE / ".env")
+pw = os.getenv("DB_PASSWORD")
+if not pw or pw == "put_your_password_here":
+    sys.exit("ERROR: edit the .env file and set DB_PASSWORD first.")
+
+url = (
+    f"postgresql+psycopg2://{os.getenv('DB_USER', 'postgres')}:{pw}"
+    f"@{os.getenv('DB_HOST', 'localhost')}:{os.getenv('DB_PORT', '5432')}"
+    f"/{os.getenv('DB_NAME', 'land_intelligence_kenya')}"
+)
+engine = create_engine(url)
+
+with engine.connect() as conn:
+    ok = conn.execute(text("SELECT 1")).scalar()
+print("Connected to database:", os.getenv("DB_NAME", "land_intelligence_kenya"))
+
+# ---------------------------------------------------------------------------
+# 2. REGISTER THE SOURCE (provenance first, always)
+# ---------------------------------------------------------------------------
+with engine.begin() as conn:
+    conn.execute(text("CREATE SCHEMA IF NOT EXISTS staging"))
+    source_id = conn.execute(
+        text("""
+            INSERT INTO metadata.sources
+                (name, organisation, tier, url, license,
+                 redistribution_allowed, api_available, notes)
+            VALUES
+                (:n, 'UN OCHA / IEBC', 2, :u, 'varies (open)',
+                 true, true, 'Common Operational Dataset admin boundaries')
+            ON CONFLICT (name) DO UPDATE SET updated_at = now()
+            RETURNING source_id
+        """),
+        {"n": SOURCE_NAME, "u": SOURCE_URL},
+    ).scalar()
+print(f"Source registered: {SOURCE_NAME} (source_id={source_id})")
+
+# ---------------------------------------------------------------------------
+# 3. OPEN AN ETL RUN RECORD
+# ---------------------------------------------------------------------------
+with engine.begin() as conn:
+    run_id = conn.execute(
+        text("""
+            INSERT INTO metadata.etl_runs (pipeline, started_at, run_status)
+            VALUES (:p, now(), 'running') RETURNING run_id
+        """),
+        {"p": PIPELINE},
+    ).scalar()
+print(f"ETL run opened (run_id={run_id})")
+
+rows_out = 0
+try:
+    # -----------------------------------------------------------------------
+    # 4. BUILD THE NAME -> COUNTY CODE LOOKUP from the seeded table
+    # -----------------------------------------------------------------------
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT county_code, name FROM admin.counties")
+        ).fetchall()
+    code_by_name = {norm(name): code for code, name in rows}
+    for alias, target in ALIASES.items():
+        if target in code_by_name:
+            code_by_name[alias] = code_by_name[target]
+
+    # -----------------------------------------------------------------------
+    # 5. COUNTIES: update the geometry of the 47 seeded rows
+    # -----------------------------------------------------------------------
+    shp = find_shapefile(["adm1", "admin1", "count"])
+    if shp is None:
+        raise RuntimeError("No counties shapefile found under data/raw. "
+                           "Download it first (see README).")
+    print(f"\nCounties file: {shp.name}")
+    gdf = clean(gpd.read_file(shp))
+    name_col = pick_column(gdf, COUNTY_NAME_COLS)
+    if name_col is None:
+        raise RuntimeError(
+            f"None of {COUNTY_NAME_COLS} found in {list(gdf.columns)}")
+
+    gdf["county_code"] = gdf[name_col].map(lambda n: code_by_name.get(norm(n)))
+    unmatched = gdf[gdf["county_code"].isna()][name_col].tolist()
+    if unmatched:
+        raise RuntimeError(
+            f"Could not match these county names: {unmatched}. "
+            "Add them to ALIASES at the top of the script and rerun.")
+
+    gdf[["county_code", "geometry"]].to_postgis(
+        "counties_raw", engine, schema="staging", if_exists="replace"
+    )
+    with engine.begin() as conn:
+        n = conn.execute(text("""
+            UPDATE admin.counties c
+            SET geom = ST_Multi(ST_CollectionExtract(ST_MakeValid(s.geometry), 3)),
+                source_id = :sid, source_date = :sd, confidence = 4
+            FROM staging.counties_raw s
+            WHERE s.county_code = c.county_code
+        """), {"sid": source_id, "sd": SOURCE_DATE}).rowcount
+    rows_out += n
+    print(f"   {n} county geometries loaded into admin.counties")
+
+    # -----------------------------------------------------------------------
+    # 6. SUBCOUNTIES (optional file)
+    # -----------------------------------------------------------------------
+    shp = find_shapefile(["adm2", "admin2", "subcount", "sub_count"])
+    if shp:
+        print(f"\nSubcounties file: {shp.name}")
+        gdf = clean(gpd.read_file(shp))
+        name_col = pick_column(gdf, SUBCOUNTY_NAME_COLS)
+        cty_col = pick_column(gdf, COUNTY_NAME_COLS)
+        gdf["county_code"] = gdf[cty_col].map(lambda n: code_by_name.get(norm(n)))
+        gdf = gdf.rename(columns={name_col: "name"})
+        gdf[["name", "county_code", "geometry"]].to_postgis(
+            "subcounties_raw", engine, schema="staging", if_exists="replace"
+        )
+        with engine.begin() as conn:
+            # Idempotent re-run: clear previous load from this same source.
+            # (Later, production versions will supersede instead of delete.)
+            conn.execute(text(
+                "DELETE FROM admin.subcounties WHERE source_id = :sid"),
+                {"sid": source_id})
+            n = conn.execute(text("""
+                INSERT INTO admin.subcounties
+                    (name, county_code, geom, source_id, source_date, confidence)
+                SELECT name, county_code,
+                       ST_Multi(ST_CollectionExtract(ST_MakeValid(geometry), 3)),
+                       :sid, :sd, 4
+                FROM staging.subcounties_raw
+            """), {"sid": source_id, "sd": SOURCE_DATE}).rowcount
+        rows_out += n
+        print(f"   {n} subcounties loaded into admin.subcounties")
+    else:
+        print("\nNo subcounties shapefile found, skipping (optional).")
+
+    # -----------------------------------------------------------------------
+    # 7. WARDS (optional file, but P1 for us: zonal statistics unit)
+    # -----------------------------------------------------------------------
+    shp = find_shapefile(["ward", "adm3"])
+    if shp:
+        print(f"\nWards file: {shp.name}")
+        gdf = clean(gpd.read_file(shp))
+        name_col = pick_column(gdf, WARD_NAME_COLS)
+        code_col = pick_column(gdf, WARD_CODE_COLS)
+        cty_col = pick_column(gdf, COUNTY_NAME_COLS)
+        if name_col is None:
+            raise RuntimeError(
+                f"No ward name column found. The file's columns are: "
+                f"{list(gdf.columns)}. Tell Claude this list.")
+        gdf["county_code"] = (
+            gdf[cty_col].map(lambda n: code_by_name.get(norm(n)))
+            if cty_col else None
+        )
+        gdf = gdf.rename(columns={name_col: "name"})
+        gdf["ward_code"] = gdf[code_col] if code_col else None
+        gdf[["ward_code", "name", "county_code", "geometry"]].to_postgis(
+            "wards_raw", engine, schema="staging", if_exists="replace"
+        )
+        with engine.begin() as conn:
+            conn.execute(text(
+                "DELETE FROM admin.wards WHERE source_id = :sid"),
+                {"sid": source_id})
+            n = conn.execute(text("""
+                INSERT INTO admin.wards
+                    (ward_code, name, county_code, geom,
+                     source_id, source_date, confidence)
+                SELECT ward_code::text, name, county_code,
+                       ST_Multi(ST_CollectionExtract(ST_MakeValid(geometry), 3)),
+                       :sid, :sd, 4
+                FROM staging.wards_raw
+            """), {"sid": source_id, "sd": SOURCE_DATE}).rowcount
+        rows_out += n
+        print(f"   {n} wards loaded into admin.wards")
+
+        # Spatial join: the file has no county column, so we ask PostGIS
+        # which county polygon contains each ward. ST_PointOnSurface gives
+        # a point guaranteed to be inside the ward (a centroid can fall
+        # outside a banana-shaped polygon; point-on-surface cannot).
+        with engine.begin() as conn:
+            n2 = conn.execute(text("""
+                UPDATE admin.wards w
+                SET county_code = c.county_code
+                FROM admin.counties c
+                WHERE w.county_code IS NULL
+                  AND ST_Contains(c.geom, ST_PointOnSurface(w.geom))
+            """)).rowcount
+        print(f"   {n2} wards assigned to their county by spatial join")
+    else:
+        print("\nNo wards shapefile found, skipping for now.")
+
+    # -----------------------------------------------------------------------
+    # 8. CLOSE THE RUN RECORD AS SUCCESS
+    # -----------------------------------------------------------------------
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'success', rows_out = :r
+            WHERE run_id = :id
+        """), {"r": rows_out, "id": run_id})
+    print(f"\nDONE. {rows_out} rows loaded. Run {run_id} logged as success.")
+    print("Verify in pgAdmin:  SELECT name, ST_IsValid(geom) FROM admin.counties LIMIT 5;")
+
+# BaseException, NOT Exception, and this is load-bearing.
+# This script's own guards raise SystemExit, and Ctrl+C raises
+# KeyboardInterrupt. Both inherit from BaseException, so an
+# `except Exception` handler never fires for them and the
+# metadata.etl_runs row is left at 'running' forever. That bug left 12
+# orphan rows across a month of work, including runs PROGRESS.md
+# documents as failures. The trailing `raise` is unchanged: this logs
+# the failure and then gets out of the way.
+except BaseException as exc:
+    # Whatever went wrong, record it. Failed runs must be visible, not silent.
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE metadata.etl_runs
+            SET finished_at = now(), run_status = 'failed', error_message = :e
+            WHERE run_id = :id
+        """), {"e": str(exc)[:2000], "id": run_id})
+    raise

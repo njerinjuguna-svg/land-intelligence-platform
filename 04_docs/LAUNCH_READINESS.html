@@ -1,0 +1,266 @@
+<title>What's Left To Launch</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+:root{
+  --paper:#F5F5F0; --card:#FFFFFF; --ink:#16201B; --ink-2:#4A574F;
+  --rule:#DFE1DA; --rule-2:#EDEEE9;
+  --done:#1B5E43; --done-soft:#E7F0EA;
+  --part:#A85E24; --part-soft:#F7EDE2;
+  --none:#A0392B; --none-soft:#F8E9E6;
+  --slate:#5D6B63; --slate-soft:#ECEEEB;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#0F1411; --card:#171E19; --ink:#E9EDE6; --ink-2:#A2AFA6;
+    --rule:#2A342D; --rule-2:#212A24;
+    --done:#5FB18C; --done-soft:#16281F;
+    --part:#D2914F; --part-soft:#2A2016;
+    --none:#D97A67; --none-soft:#2B1A17;
+    --slate:#94A29A; --slate-soft:#1D251F;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#0F1411; --card:#171E19; --ink:#E9EDE6; --ink-2:#A2AFA6;
+  --rule:#2A342D; --rule-2:#212A24;
+  --done:#5FB18C; --done-soft:#16281F;
+  --part:#D2914F; --part-soft:#2A2016;
+  --none:#D97A67; --none-soft:#2B1A17;
+  --slate:#94A29A; --slate-soft:#1D251F;
+}
+*{box-sizing:border-box}
+body{margin:0; background:var(--paper); color:var(--ink);
+  font-family:"Public Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  font-size:16px; line-height:1.55; -webkit-font-smoothing:antialiased}
+.wrap{max-width:920px; margin:0 auto; padding:44px 20px 80px}
+h1,h2,h3{font-family:"Newsreader",Georgia,serif; text-wrap:balance; font-weight:500;
+  letter-spacing:-.015em}
+h1{font-size:clamp(32px,5.4vw,46px); line-height:1.06; margin:.2em 0 .3em}
+.num{font-family:"IBM Plex Mono",ui-monospace,monospace; font-variant-numeric:tabular-nums}
+.eyebrow{font-size:11.5px; font-weight:600; letter-spacing:.14em; text-transform:uppercase;
+  color:var(--ink-2)}
+.lede{font-size:18px; color:var(--ink-2); max-width:62ch; margin:0 0 8px}
+.lede b{color:var(--ink); font-weight:600}
+
+/* --- the built/left split ------------------------------------------------ */
+.split{display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--rule);
+  border:1px solid var(--rule); border-radius:4px; overflow:hidden; margin:34px 0 0}
+@media(max-width:640px){.split{grid-template-columns:1fr}}
+.half{background:var(--card); padding:22px 24px}
+.half h3{margin:0 0 4px; font-size:19px}
+.half p{margin:0; font-size:13.5px; color:var(--ink-2)}
+.half ul{margin:12px 0 0; padding-left:18px; font-size:14px}
+.half li{margin-bottom:5px}
+.half.built h3{color:var(--done)}
+.half.left h3{color:var(--part)}
+
+section{margin-top:56px}
+.sec-head{display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:6px}
+.sec-head h2{font-size:26px; margin:0}
+.tag{font-size:11px; font-weight:700; letter-spacing:.1em; text-transform:uppercase;
+  padding:3px 9px; border-radius:2px}
+.tag.blocker{background:var(--none-soft); color:var(--none); border:1px solid var(--none)}
+.tag.build{background:var(--part-soft); color:var(--part); border:1px solid var(--part)}
+.tag.call{background:var(--slate-soft); color:var(--slate); border:1px solid var(--slate)}
+.sec-sub{color:var(--ink-2); font-size:14.5px; max-width:68ch; margin:0 0 20px}
+
+.item{background:var(--card); border:1px solid var(--rule); border-radius:4px;
+  padding:20px 22px; margin-bottom:12px; border-left:3px solid var(--edge,var(--rule))}
+.item.none{--edge:var(--none)} .item.part{--edge:var(--part)} .item.done{--edge:var(--done)}
+.item-top{display:flex; justify-content:space-between; align-items:baseline; gap:14px;
+  flex-wrap:wrap; margin-bottom:7px}
+.item h4{margin:0; font-size:16.5px; font-weight:600; font-family:"Public Sans",sans-serif}
+.state{font-size:11.5px; font-weight:700; letter-spacing:.09em; text-transform:uppercase;
+  white-space:nowrap}
+.item.none .state{color:var(--none)} .item.part .state{color:var(--part)}
+.item.done .state{color:var(--done)}
+.item p{margin:0 0 8px; font-size:14.5px; color:var(--ink-2)}
+.item p:last-child{margin-bottom:0}
+.item b{color:var(--ink)}
+.item code{font-family:"IBM Plex Mono",monospace; font-size:13px;
+  background:var(--slate-soft); padding:1px 5px; border-radius:2px}
+
+/* --- critical path ------------------------------------------------------- */
+.path{counter-reset:s; list-style:none; padding:0; margin:22px 0 0}
+.path li{counter-increment:s; position:relative; padding:0 0 22px 46px;
+  border-left:1px solid var(--rule); margin-left:14px}
+.path li:last-child{border-left-color:transparent; padding-bottom:0}
+.path li:before{content:counter(s); position:absolute; left:-14px; top:-2px;
+  width:28px; height:28px; border-radius:50%; display:grid; place-content:center;
+  font-family:"IBM Plex Mono",monospace; font-size:13px; font-weight:600;
+  background:var(--done-soft); color:var(--done); border:1px solid var(--done)}
+.path b{display:block; font-size:16px; margin-bottom:3px}
+.path p{margin:0; font-size:14px; color:var(--ink-2)}
+.path .why{font-size:13px; color:var(--ink-2); margin-top:5px; font-style:italic}
+
+.callout{background:var(--card); border:1px solid var(--rule); border-left:3px solid var(--none);
+  border-radius:4px; padding:22px 24px; margin-top:22px}
+.callout h3{margin:0 0 8px; font-size:19px; color:var(--none)}
+.callout p{margin:0 0 9px; font-size:14.5px; color:var(--ink-2)}
+.callout p:last-child{margin:0}
+.callout b{color:var(--ink)}
+
+.foot{margin-top:56px; padding-top:20px; border-top:1px solid var(--rule);
+  font-size:12.5px; color:var(--ink-2)}
+:focus-visible{outline:2px solid var(--done); outline-offset:2px}
+</style>
+
+<div class="wrap">
+
+  <div class="eyebrow">Land Intelligence Platform · 24 August 2026</div>
+  <h1>What's left to launch</h1>
+  <p class="lede">The intelligence is largely built. What is missing is mostly <b>the thing a client installs, somewhere for it to run, and the paperwork that makes it sellable</b> — and one of those three is further behind than it looks.</p>
+
+  <div class="split">
+    <div class="half built">
+      <h3>Built and verified</h3>
+      <p>Roughly nine months of the hard part.</p>
+      <ul>
+        <li><span class="num">30</span> ETL pipelines, <span class="num">12</span> schema migrations</li>
+        <li>Enrichment engine — <span class="num">43</span> assertions passing</li>
+        <li>Suitability scoring — <span class="num">71</span> checks, 4 of 20 parcels correctly refused</li>
+        <li>Embed API: key auth, row-level scoping, geometry firewall, usage logging</li>
+        <li>PDF generator, versioned and reproducible</li>
+        <li>Buyer page design settled and agreed</li>
+      </ul>
+    </div>
+    <div class="half left">
+      <h3>Not yet built</h3>
+      <p>Smaller than the above. Not small.</p>
+      <ul>
+        <li>The embed script itself — <code>v1.js</code></li>
+        <li>Any server. It runs on one laptop.</li>
+        <li>Client onboarding with rejection gates</li>
+        <li>Rate limiting and billing</li>
+        <li>4 drafted letters, unsent; 1 not drafted</li>
+        <li>A price</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout">
+    <h3>The one that should worry you most</h3>
+    <p><b>The whole architecture is "two lines in the client's page", and those two lines point at a file that does not exist.</b> <code>06_delivery/</code> holds three Python files and nothing else — no <code>v1.js</code>, no server config, no deployment.</p>
+    <p>The API works. It works on <code>127.0.0.1</code> on your machine, reachable by nothing. Every demo so far has been you running <code>uvicorn</code> in a PowerShell window. <b>A client cannot buy that.</b> It is not a large job — a loader script, a host, a domain, TLS — but it is the difference between a project and a product, and nothing else on this list matters until it is done.</p>
+  </div>
+
+  <section>
+    <div class="sec-head"><h2>1. The deliverable</h2><span class="tag build">Build</span></div>
+    <p class="sec-sub">What a paying client actually receives. This is the shortest section and the most urgent.</p>
+
+    <div class="item none">
+      <div class="item-top"><h4>v1.js — the embed loader</h4><span class="state">Not started</span></div>
+      <p>Reads <code>data-plot-ref</code> and <code>data-key</code> off the script tag, calls <code>/v1/plots/{ref}/embed</code>, injects the returned HTML into the host page. Handles the plot-not-found and key-rejected cases without breaking the client's layout.</p>
+      <p>Small — an afternoon. It is item one because everything downstream assumes it.</p>
+    </div>
+
+    <div class="item none">
+      <div class="item-top"><h4>Somewhere to run</h4><span class="state">Not started</span></div>
+      <p>A host, a domain, TLS, the database migrated off the laptop, backups, and something that restarts uvicorn when it dies. <b>Checklist E10 flags this as blocking:</b> diff the schema snapshot against the versioned SQL files before migrating, because the database could not be rebuilt from its own files once already and only the snapshot caught it.</p>
+    </div>
+
+    <div class="item none">
+      <div class="item-top"><h4>Rate limiting and usage billing</h4><span class="state">Not started</span></div>
+      <p><code>clients.subscriptions</code> and <code>clients.api_usage</code> exist and the API already writes usage rows. Nothing reads them, and nothing stops a client calling a million times.</p>
+    </div>
+
+    <div class="item part">
+      <div class="item-top"><h4>The map on the buyer page</h4><span class="state">Decided, not built</span></div>
+      <p>Google Maps satellite tile with the plot boundary drawn over it, plus Street View where coverage exists. Needs a Cloud key with billing enabled. The boundary is the seller's own survey data, so nothing is licensed from anyone else — this was mistakenly thought blocked by B4, which only ever applied to the PDF.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>2. Getting a client's plots in</h2><span class="tag build">Build</span></div>
+    <p class="sec-sub">A loader exists and has ingested real KMZ. What it does not do is refuse bad input — and this test set already contains two examples of input it should have refused.</p>
+
+    <div class="item part">
+      <div class="item-top"><h4>Upload rejection gates</h4><span class="state">Detected, not enforced</span></div>
+      <p><b>PLOT-1069 and PLOT-1070 are one polygon under two references</b> — either a drafting duplicate or the same ground sold twice. <b>PLOT-950 reads slope 14.38° against a project median of 3.00°</b>, which neighbouring plots in one subdivision do not do; the repair at load probably moved it onto ground that is not the plot.</p>
+      <p>The verifier catches both, <i>after</i> enrichment. <b>The upload must reject them before a buyer ever sees a report.</b> Same principle as everywhere else in this build: a rule you have to remember is a reminder, a rule the code cannot proceed without is a control.</p>
+    </div>
+
+    <div class="item none">
+      <div class="item-top"><h4>parcel_ref mapping, and keeping status current</h4><span class="state">Not started</span></div>
+      <p>Their site says "Plot 457", the database says <code>parcel_ref</code>. Agreed once at onboarding. <b>Listing status is the second handshake and it never stops</b> — the availability panel is the strongest sales feature on the page and it goes stale silently. Today all eight Oak Grove plots read <code>available</code> and every price is null.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>3. Legal</h2><span class="tag blocker">Blocks selling</span></div>
+    <p class="sec-sub">Five letters drafted in <code>04_docs/correspondence/</code>. One sent. This is the long pole and has been for four sessions — not because it is hard, but because it is waiting on other people, which means starting it early is the whole trick.</p>
+
+    <div class="item none">
+      <div class="item-top"><h4>A1 — WDPA is non-commercial</h4><span class="state">Send the KWS letter</span></div>
+      <p>Powers <code>in_protected_area</code> on 19 of 20 parcels — a field that can refuse to score land entirely. <b>The cheapest high-value move on the board:</b> it closes A1 <i>and</i> replaces a coarse boundary that currently blocks saleable land near park edges.</p>
+    </div>
+
+    <div class="item part">
+      <div class="item-top"><h4>A2 — CA coverage has no declared licence</h4><span class="state">Sent, awaiting reply</span></div>
+      <p>Told verbally that no licence is needed. <b>Do not close on that.</b> "Someone said so on the phone" is not an answer to a client or an acquirer. Same thread carries B1 and B1b — the two operator layers that are byte-for-byte the same data.</p>
+    </div>
+
+    <div class="item none">
+      <div class="item-top"><h4>A3 — OpenCellID is share-alike</h4><span class="state">Price the commercial licence</span></div>
+      <p>The one you can pay your way out of. Unwired Labs sell commercial licences; it may cost less than engineering a replacement, and it closes outright.</p>
+    </div>
+
+    <div class="item none">
+      <div class="item-top"><h4>A5, B7 — Kenya Power and WASREB</h4><span class="state">1 drafted, 1 to draft</span></div>
+      <p>Electricity and water/sewer distance. <b>Neither has a free fallback</b> — both are buried or unmapped infrastructure, so OSM has effectively nothing. Letter or nothing.</p>
+    </div>
+
+    <div class="item part">
+      <div class="item-top"><h4>A4 — ODbL share-alike</h4><span class="state">Contained by design</span></div>
+      <p>The embed architecture already answers this: the client receives values and pictures, never geometry. <code>riparian_buffers</code> remains the one high-exposure item because it is derived geometry and therefore unambiguously a database — it must never be handed out.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>4. Judgement calls only you can make</h2><span class="tag call">Decide</span></div>
+    <p class="sec-sub">No amount of engineering settles these, and two of them shape what the product is.</p>
+
+    <div class="item none">
+      <div class="item-top"><h4>B5 — what the platform says about title</h4><span class="state">Open</span></div>
+      <p>Say nothing, say plainly what we do not do, or integrate an advocate's search as a paid step. In this market it is the claim a buyer trusts most and the one most likely to end in court. <b>No "Verified" badge on any page until this is decided.</b></p>
+    </div>
+
+    <div class="item none">
+      <div class="item-top"><h4>Price, and what a subscription buys</h4><span class="state">Open</span></div>
+      <p>Per plot, per scheme, per month, per report download? The billing code cannot be written until this is answered, and the client agreement cannot be drafted either.</p>
+    </div>
+
+    <div class="item part">
+      <div class="item-top"><h4>The model does not separate neighbours</h4><span class="state">Known, unresolved</span></div>
+      <p>All seven Oak Grove plots score 94–98 residential. Neighbours <i>should</i> be similar — but that tight a band at the top means the model is not discriminating between plots in one scheme, <b>which is exactly the comparison a buyer in that scheme is making</b>. Either find a within-scheme signal, or say plainly that the score is about the area and the differences are size and price.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>The critical path to one paying client</h2></div>
+    <p class="sec-sub">Ordered by what unblocks what, not by size.</p>
+    <ol class="path">
+      <li><b>Send the four unsent letters this week</b>
+        <p>KWS, Kenya Power, WRA, KNBS — plus draft WASREB. They are written and sitting in a folder.</p>
+        <p class="why">They wait on other people. Everything else waits on you, so these go first regardless of what else is happening.</p></li>
+      <li><b>Write v1.js and deploy somewhere real</b>
+        <p>Loader, host, domain, TLS, database off the laptop. Snapshot-diff the schema before migrating.</p>
+        <p class="why">Until this exists there is nothing to sell, and no demo that survives you closing your laptop.</p></li>
+      <li><b>Add the upload rejection gates</b>
+        <p>Duplicate geometry and boundary confidence, refused at load rather than flagged after enrichment.</p>
+        <p class="why">The first client's data will be worse than Oak Grove's, and Oak Grove already has two bad parcels in eight.</p></li>
+      <li><b>Decide title and price</b>
+        <p>B5 and the commercial model. Both block the client agreement.</p></li>
+      <li><b>Run one client end to end</b>
+        <p>Their KMZ in, their plots scored, the widget live on their page, one PDF sold.</p>
+        <p class="why">Everything before this is preparation. This is the first evidence that any of it works.</p></li>
+    </ol>
+  </section>
+
+  <div class="foot">
+    Compiled from <code>PROGRESS.md</code>, <code>PRE_LAUNCH_CHECKLIST.md</code> and a full file listing of the working tree, 24 August 2026 · Geocode Spatial Solutions Ltd
+  </div>
+
+</div>

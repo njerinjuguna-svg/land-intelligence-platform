@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LandIQ — plot detail</title>
+<style>
+:root{
+ color-scheme:light;
+ --plane:#f4f6f4;--surface:#fff;--surface-2:#f1f3f1;--line:#e2e6e2;
+ --ink:#12211a;--ink-2:#54615a;--ink-3:#8a948e;
+ --brand:#1a7f4b;--brand-ink:#fff;
+ --good:#0ca30c;--warn:#fab219;--bad:#d03b3b;--unknown:#8a948e;
+ --shadow:0 1px 2px rgba(16,32,24,.05),0 6px 18px rgba(16,32,24,.05);
+}
+:root[data-theme="dark"]{
+ color-scheme:dark;
+ --plane:#0d0f0e;--surface:#191c1a;--surface-2:#222624;--line:#31352f;
+ --ink:#fff;--ink-2:#c3c2b7;--ink-3:#8b8a80;
+ --brand:#2ea16a;--brand-ink:#06130c;
+ --good:#0ca30c;--warn:#fab219;--bad:#d03b3b;--unknown:#8b8a80;
+ --shadow:none;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--plane);color:var(--ink);
+ font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+ -webkit-font-smoothing:antialiased}
+button,select,input{font:inherit}
+
+/* top nav */
+nav{background:var(--surface);border-bottom:1px solid var(--line);padding:11px 20px;
+ display:flex;gap:18px;align-items:center;position:sticky;top:0;z-index:20}
+.logo{display:flex;gap:9px;align-items:center}
+.logo .mk{width:32px;height:32px;border-radius:9px;background:var(--brand);
+ display:grid;place-items:center;color:#fff;font-weight:700;font-size:15px}
+.logo b{display:block;font-size:17px;letter-spacing:-.02em;line-height:1.1}
+.logo span{font-size:10.5px;color:var(--ink-3);letter-spacing:.02em}
+.search{flex:1;max-width:440px;display:flex;gap:8px;align-items:center;
+ background:var(--surface-2);border:1px solid var(--line);border-radius:11px;padding:9px 13px}
+.search input{border:0;background:none;outline:none;color:var(--ink);width:100%;font-size:14px}
+nav .links{margin-left:auto;display:flex;gap:20px;align-items:center;font-size:14px;color:var(--ink-2)}
+nav .cta{background:var(--brand);color:var(--brand-ink);border:0;border-radius:9px;
+ padding:9px 16px;font-weight:600;font-size:14px;cursor:pointer}
+nav .ghost{background:none;border:1px solid var(--line);border-radius:9px;padding:8px 12px;
+ color:var(--ink-2);cursor:pointer;font-size:13px}
+
+/* layout */
+.app{display:grid;grid-template-columns:230px 1fr 300px;gap:16px;padding:16px 20px 50px;
+ max-width:1560px;margin:0 auto;align-items:start}
+@media(max-width:1200px){.app{grid-template-columns:1fr 300px}.side{display:none}}
+@media(max-width:900px){.app{grid-template-columns:1fr}.rail{order:-1}}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow)}
+.pad{padding:15px 16px}
+h3{margin:0 0 12px;font-size:15px;font-weight:640;letter-spacing:-.01em}
+h4{margin:0 0 3px;font-size:12px;font-weight:640;color:var(--ink-3);
+ text-transform:uppercase;letter-spacing:.07em}
+
+/* sidebar */
+.filter{display:flex;justify-content:space-between;align-items:center;padding:10px 2px;
+ border-bottom:1px solid var(--line);font-size:14px;color:var(--ink-2);cursor:pointer}
+.filter:last-child{border-bottom:0}
+.listing{display:flex;gap:10px;padding:10px;border-radius:11px;cursor:pointer;
+ border:1px solid transparent}
+.listing:hover{background:var(--surface-2)}
+.listing.on{border-color:var(--brand);background:var(--surface-2)}
+.thumb{width:52px;height:44px;border-radius:8px;flex:none;
+ background:linear-gradient(150deg,#3d6b4e,#7a9b63 55%,#c3b284)}
+.listing b{display:block;font-size:13.5px;font-weight:600;letter-spacing:-.01em}
+.listing span{display:block;font-size:12px;color:var(--ink-3)}
+.listing .p{font-size:12.5px;color:var(--brand);font-weight:600;margin-top:2px}
+
+/* centre */
+.head{display:flex;gap:12px;align-items:center;margin-bottom:12px}
+.head h2{margin:0;font-size:19px;letter-spacing:-.02em}
+.head .acts{margin-left:auto;display:flex;gap:8px}
+
+/* schematic map */
+.map{position:relative;height:400px;border-radius:13px;overflow:hidden;
+ background:radial-gradient(120% 90% at 30% 20%,#4a6b4f 0%,#3c5a45 40%,#2f4738 100%)}
+:root[data-theme="dark"] .map{background:radial-gradient(120% 90% at 30% 20%,#2b3f31 0%,#223228 45%,#18251d 100%)}
+.map .grid{position:absolute;inset:0;opacity:.16;
+ background-image:linear-gradient(rgba(255,255,255,.5) 1px,transparent 1px),
+                  linear-gradient(90deg,rgba(255,255,255,.5) 1px,transparent 1px);
+ background-size:44px 44px}
+.map svg{position:absolute;inset:0;width:100%;height:100%}
+.pin{position:absolute;transform:translate(-50%,-50%);background:rgba(12,20,15,.82);
+ color:#fff;border-radius:9px;padding:5px 9px;font-size:11.5px;line-height:1.25;
+ white-space:nowrap;backdrop-filter:blur(3px);border:1px solid rgba(255,255,255,.12)}
+.pin i{display:block;font-style:normal;color:#b9c9bd;font-size:10.5px}
+.maptag{position:absolute;left:12px;bottom:12px;background:rgba(12,20,15,.82);color:#dfe7e1;
+ border-radius:8px;padding:6px 10px;font-size:11px;max-width:62%;line-height:1.4}
+.zoom{position:absolute;right:12px;bottom:12px;display:flex;flex-direction:column;gap:1px}
+.zoom button{width:32px;height:32px;border:1px solid var(--line);background:var(--surface);
+ color:var(--ink);cursor:pointer}
+.zoom button:first-child{border-radius:8px 8px 0 0}
+.zoom button:last-child{border-radius:0 0 8px 8px}
+
+/* tabs */
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin-top:14px;overflow-x:auto}
+.tabs button{background:none;border:0;border-bottom:2px solid transparent;padding:12px 14px;
+ color:var(--ink-2);cursor:pointer;font-size:14px;white-space:nowrap}
+.tabs button.on{color:var(--brand);border-bottom-color:var(--brand);font-weight:600}
+.tabpane{padding:16px 0 0}
+.tabpane.off{display:none}
+
+.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.fact{border:1px solid var(--line);border-radius:11px;padding:12px 13px}
+.fact b{display:block;font-size:15px;font-weight:640;margin-top:2px}
+.chips{display:flex;flex-wrap:wrap;gap:7px;margin-top:14px}
+.chip{border-radius:20px;padding:5px 11px;font-size:12.5px;border:1px solid var(--line);
+ background:var(--surface-2);color:var(--ink-2)}
+.chip.g{color:var(--good);border-color:color-mix(in srgb,var(--good) 35%,var(--line))}
+.chip.w{color:#8a6200;border-color:color-mix(in srgb,var(--warn) 45%,var(--line))}
+:root[data-theme="dark"] .chip.w{color:var(--warn)}
+.chip.u{color:var(--ink-3);border-style:dashed}
+
+.rowline{display:flex;justify-content:space-between;gap:12px;padding:10px 0;
+ border-bottom:1px solid var(--line);font-size:14px}
+.rowline:last-child{border-bottom:0}
+.rowline .k{color:var(--ink-2)}
+.rowline .v{font-weight:600;text-align:right}
+.v.good{color:var(--good)}.v.warn{color:#8a6200}.v.bad{color:var(--bad)}.v.unk{color:var(--ink-3);font-weight:500}
+:root[data-theme="dark"] .v.warn{color:var(--warn)}
+
+.note{background:var(--surface-2);border-radius:10px;padding:12px 14px;font-size:13.5px;
+ color:var(--ink-2);margin-top:14px}
+.note b{color:var(--ink)}
+.pending{border:1px dashed var(--line);border-radius:10px;padding:12px 14px;font-size:13.5px;
+ color:var(--ink-2);margin-top:10px}
+.pending b{color:var(--ink);display:block;margin-bottom:2px}
+
+/* right rail */
+.gauge{display:grid;place-items:center;padding:6px 0 2px}
+.gauge svg{transform:rotate(-90deg)}
+.gnum{position:absolute;text-align:center}
+.gnum b{display:block;font-size:34px;font-weight:680;letter-spacing:-.03em;line-height:1}
+.gnum span{font-size:13px;color:var(--ink-2)}
+.gwrap{position:relative;display:grid;place-items:center}
+.usebtn{display:flex;gap:5px;margin:12px 0 0}
+.usebtn button{flex:1;border:1px solid var(--line);background:var(--surface-2);border-radius:8px;
+ padding:6px 4px;font-size:11.5px;color:var(--ink-2);cursor:pointer}
+.usebtn button.on{background:var(--brand);color:var(--brand-ink);border-color:var(--brand);font-weight:600}
+.dl{display:block;width:100%;margin-top:12px;background:var(--surface-2);border:1px solid var(--line);
+ border-radius:10px;padding:11px;font-size:13.5px;font-weight:600;color:var(--ink);cursor:pointer}
+.ins{display:flex;justify-content:space-between;gap:10px;padding:9px 0;font-size:13.5px;
+ border-bottom:1px solid var(--line)}
+.ins:last-child{border-bottom:0}
+.ins .k{display:flex;gap:8px;align-items:center;color:var(--ink-2)}
+.dot{width:7px;height:7px;border-radius:50%;flex:none}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="logo"><div class="mk">L</div><div><b>LandIQ</b><span>by Geocode Spatial</span></div></div>
+  <div class="search">🔍<input placeholder="Search location, project or plot ID"></div>
+  <div class="links"><span>Explore</span><span>How It Works</span><span>About Us</span>
+    <button class="ghost" id="theme">Dark</button>
+    <button class="cta">Talk to Sales</button></div>
+</nav>
+
+<div class="app">
+
+  <div class="side">
+    <div class="card pad" style="margin-bottom:14px">
+      <h3>Find your land</h3>
+      <div class="filter">Price range ›</div>
+      <div class="filter">Land use ›</div>
+      <div class="filter">Plot size ›</div>
+      <div class="filter">Amenities ›</div>
+      <div class="filter">Risk &amp; suitability ›</div>
+    </div>
+    <div class="card pad">
+      <h3>Plots</h3>
+      <div id="listings"></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="head">
+      <h2 id="title">—</h2>
+      <div class="acts"><button class="ghost">Share</button><button class="ghost">♡ Save</button></div>
+    </div>
+
+    <div class="map" id="map">
+      <div class="grid"></div>
+      <svg id="mapsvg"></svg>
+      <div class="maptag" id="maptag"></div>
+      <div class="zoom"><button>+</button><button>−</button></div>
+    </div>
+
+    <div class="tabs" id="tabs"></div>
+    <div id="panes"></div>
+  </div>
+
+  <div class="rail">
+    <div class="card pad" style="margin-bottom:14px">
+      <h3>Land suitability score</h3>
+      <div class="gauge"><div class="gwrap">
+        <svg width="150" height="150" viewBox="0 0 150 150">
+          <circle cx="75" cy="75" r="62" fill="none" stroke="var(--line)" stroke-width="11"/>
+          <circle id="arc" cx="75" cy="75" r="62" fill="none" stroke="var(--brand)" stroke-width="11"
+            stroke-linecap="round" stroke-dasharray="389.6" stroke-dashoffset="389.6"/>
+        </svg>
+        <div class="gnum"><b id="gscore">—</b><span id="glabel">—</span></div>
+      </div></div>
+      <div class="usebtn" id="uses"></div>
+      <p style="margin:12px 0 0;font-size:13px;color:var(--ink-2)" id="gtext">—</p>
+      <button class="dl">⤓ Download full report (PDF)</button>
+      <p style="margin:9px 0 0;font-size:11.5px;color:var(--ink-3)" id="gconf">—</p>
+    </div>
+
+    <div class="card pad" style="margin-bottom:14px">
+      <h3>Key insights</h3>
+      <div id="insights"></div>
+    </div>
+
+    <div class="card pad">
+      <h3>Nearby</h3>
+      <div id="nearby"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* Real values from enrichment run de64a830 and scoring model 0.1.0-judgement.
+   Fields we do NOT hold are marked pending — never filled with a guess.      */
+const PLOTS={
+'PLOT-457':{name:'Oak Grove — Plot 457',where:'Ruaka scheme, Kiambu',size:'0.5 acres',
+ price:'From the seller',
+ scores:{residential:83,agricultural:57,commercial:40,investment:47},best:'residential',
+ conf:'Fairly confident — soil check inconclusive on this ground.',
+ flood:{v:'Low',c:'good',txt:'The whole plot reads low risk and the surrounding area is drier than most of Kenya.'},
+ road:{v:'59 m',c:'good'}, water:{v:'1.6 km to a water point',c:'warn'},
+ mast:{v:'1.0 km',c:'good'}, cov:{v:'4G across the area',c:'good'},
+ slope:'2.88°', soil:'Nitisols, clay', rain:'996 mm/yr', ndvi:'green year-round',
+ riparian:false, protected:false,
+ near:[['Main road',59],['Primary school',744],['Mobile mast',1012],['Clinic',1327],
+       ['Hospital',1327],['Water point',1597],['Tarmac road',2374],['Secondary school',2728]],
+ risks:[['Flooding','Low','good','No part of this plot is in a flood-prone class.'],
+        ['River reserve','None','good','No mapped watercourse reserve touches this plot.'],
+        ['Protected area','None','good','Not inside or adjoining a gazetted area.'],
+        ['Ground soil','Check needed','warn','Flat ground near Nairobi — a soil test should confirm whether this is black cotton before you cost the foundation.']]},
+
+'PLOT-950':{name:'Oak Grove — Plot 950',where:'Ruaka scheme, Kiambu',size:'2 – 8.5 acres (disputed)',
+ price:'From the seller', withheld:true,
+ scores:{}, best:null, conf:'Not rated — boundary unverified.',
+ flood:{v:'Not rated',c:'unk',txt:'Cannot be assessed until the boundary is confirmed.'},
+ road:{v:'74 m',c:'good'}, water:{v:'1.1 km to a water point',c:'warn'},
+ mast:{v:'1.5 km',c:'good'}, cov:{v:'4G across the area',c:'good'},
+ slope:'—', soil:'—', rain:'996 mm/yr', ndvi:'—', riparian:true, protected:false,
+ near:[['River','on the plot'],['Main road',74],['Primary school',1011],['Water point',1074],
+       ['Mobile mast',1504],['Clinic',1626],['Secondary school',2242],['Tarmac road',2869]],
+ risks:[['Plot boundary','Unverified','bad','The boundary supplied does not close. Corrected, the size jumped from 2 to 8.5 acres. Ask the seller for the mutation drawing.']]},
+
+'TEST-KITENGELA-01':{name:'Kitengela plot',where:'Kitengela, Kajiado',size:'10 acres',
+ price:'From the seller',
+ scores:{residential:83,agricultural:57,commercial:40,investment:47},best:'residential',
+ conf:'Fairly confident.',
+ flood:{v:'Very low',c:'good',txt:'Flat, dry ground with no flood-prone land in the surrounding kilometre at all.'},
+ road:{v:'94 m',c:'good'}, water:{v:'7.4 km to a water point',c:'bad'},
+ mast:{v:'402 m',c:'good'}, cov:{v:'4G across the area',c:'good'},
+ slope:'0.47°', soil:'Vertisols, clay', rain:'700 mm/yr', ndvi:'moderate',
+ riparian:false, protected:false,
+ near:[['Main road',94],['Mobile mast',402],['River',950],['Clinic',1465],['Hospital',1465],
+       ['Primary school',4656],['Secondary school',5903],['Water point',7351],['Tarmac road',9440]],
+ risks:[['Flooding','Very low','good','No flood-prone land found on or around this plot.'],
+        ['Ground soil','Black cotton','warn','This is black cotton soil. It swells and shrinks with moisture and will raise your foundation cost. Budget for it.'],
+        ['Water supply','No mapped source','bad','Nothing within 7 km. Plan for a borehole or delivery.'],
+        ['Tarmac access','9.4 km','warn','The nearest tarmac road is a long way out.']]},
+
+'TEST-KANO-01':{name:'Kano plains parcel',where:'Kano plains, Kisumu',size:'10 acres',
+ price:'From the seller',
+ scores:{residential:35,agricultural:89,commercial:50,investment:32},best:'agricultural',
+ conf:'Fairly confident.',
+ flood:{v:'Very high',c:'bad',txt:'Half of this plot sits in the highest flood class, and so does the land around it.'},
+ road:{v:'41 m',c:'good'}, water:{v:'1.3 km to a water point',c:'good'},
+ mast:{v:'369 m',c:'good'}, cov:{v:'4G across the area',c:'good'},
+ slope:'0.29°', soil:'Vertisols, clay loam', rain:'1,564 mm/yr', ndvi:'high',
+ riparian:true, protected:false,
+ near:[['River','on the plot'],['Main road',41],['Mobile mast',369],['Primary school',530],
+       ['Tarmac road',556],['Secondary school',606],['Water point',1339],['Clinic',3916],
+       ['Hospital',4721]],
+ risks:[['Flooding','Very high','bad','Expect water on this land in a heavy season. Do not site a house on it.'],
+        ['River reserve','Part of the plot','bad','A watercourse crosses this plot. You cannot build inside the statutory reserve — have a surveyor mark it.'],
+        ['Ground soil','Black cotton','warn','Heavy clay. Excellent for growing, expensive to build on.']]},
+
+'TEST-TANADELTA-01':{name:'Tana delta parcel',where:'Tana River',size:'50 acres',
+ price:'From the seller', blocked:'protected',
+ scores:{}, best:null, conf:'Not rated — inside a protected area.',
+ flood:{v:'Very high',c:'bad',txt:'A large part of the plot is in the highest flood class and a river runs through it.'},
+ road:{v:'38 m',c:'good'}, water:{v:'None within 25 km',c:'bad'},
+ mast:{v:'1.2 km',c:'good'}, cov:{v:'4G across the area',c:'good'},
+ slope:'0.84°', soil:'Vertisols, clay', rain:'1,173 mm/yr', ndvi:'moderate',
+ riparian:true, protected:true,
+ near:[['River','on the plot'],['Primary school','on the plot'],['Main road',38],
+       ['Mobile mast',1198],['Clinic',7939],['Secondary school',14140],['Tarmac road',15817],
+       ['Hospital',23826]],
+ risks:[['Protected area','Inside one','bad','Our data places this plot inside a gazetted protected area. Land inside one normally cannot be sold. Do not pay a deposit before the seller shows written proof from the authorities.'],
+        ['Flooding','Very high','bad','Large parts of the plot flood.'],
+        ['River reserve','Part of the plot','bad','A watercourse crosses this land.']]}
+};
+
+/* Fields the platform does NOT yet hold. Shown as pending, never guessed. */
+const PENDING={
+ electricity:{label:'Electricity connection',
+   why:'Kenya Power’s distribution network is not public data. We have applied for a derived-use licence — until it is granted we will not tell you how far the nearest line is.',
+   interim:'The open map we do hold misses most low-voltage lines, so a distance from it would mislead.'},
+ zoning:{label:'Land use zone',
+   why:'County planning data is not published in a form we can use. We are approaching the counties directly.',
+   interim:'Ask the county planning office for the zoning of this parcel.'},
+ title:{label:'Title status',
+   why:'We do not search the Lands registry, so we cannot tell you whether a title is clean, charged or disputed.',
+   interim:'Your advocate must do an official search. This is the single most important check before any money moves.'},
+ piped:{label:'Piped water',
+   why:'We hold community water points, not utility pipe networks.',
+   interim:'The distance we show is to the nearest mapped water point, which is not the same as a mains connection.'}};
+
+const NAME={residential:'Home',agricultural:'Farm',commercial:'Business',investment:'Invest'};
+const TABS=['Overview','Suitability','Amenities','Risks','Network','Legal'];
+let current='PLOT-457', activeUse='residential', activeTab=0;
+
+function dist(v){ if(v==='on the plot')return{a:'On the plot',b:''};
+ if(v<1000)return{a:v+' m',b:Math.round(v/80)+' min walk'};
+ return{a:(v/1000).toFixed(1)+' km',b:Math.max(1,Math.round(v/1000/40*60))+' min drive'};}
+
+function band(s){return s>=75?['Good','var(--good)']:s>=55?['Fair','var(--warn)']:['Poor','var(--bad)'];}
+
+function drawMap(p){
+  const svg=document.getElementById('mapsvg'); const W=760,H=400;
+  svg.setAttribute('viewBox','0 0 '+W+' '+H);
+  const cx=W*0.42, cy=H*0.52;
+  let out='<polygon points="'+[[cx-95,cy-58],[cx+92,cy-72],[cx+104,cy+56],[cx-84,cy+66]]
+    .map(q=>q.join(',')).join(' ')+'" fill="rgba(122,214,140,.30)" stroke="#8fe3a4" stroke-width="2.5"/>';
+  out+='<circle cx="'+cx+'" cy="'+cy+'" r="9" fill="#8fe3a4" stroke="#0d2415" stroke-width="2.5"/>';
+  svg.innerHTML=out;
+  document.querySelectorAll('.pin').forEach(e=>e.remove());
+  const near=p.near.filter(n=>n[1]!=='on the plot').slice(0,5);
+  const spots=[[0.14,0.16],[0.62,0.12],[0.86,0.42],[0.72,0.80],[0.10,0.72]];
+  near.forEach((n,i)=>{const d=dist(n[1]);
+    const el=document.createElement('div'); el.className='pin';
+    el.style.left=(spots[i][0]*100)+'%'; el.style.top=(spots[i][1]*100)+'%';
+    el.innerHTML=n[0]+'<i>'+d.a+'</i>'; document.getElementById('map').appendChild(el);});
+  document.getElementById('maptag').innerHTML=
+    'Schematic. In the live product this panel is satellite imagery with the surveyed '+
+    'boundary drawn on our servers — pin positions here show distance, not direction.';
+}
+
+function insight(k,v,c){
+  const col=c==='good'?'var(--good)':c==='warn'?'var(--warn)':c==='bad'?'var(--bad)':'var(--unknown)';
+  return '<div class="ins"><span class="k"><span class="dot" style="background:'+col+'"></span>'+k+
+    '</span><span class="v '+(c==='unk'?'unk':c)+'">'+v+'</span></div>';}
+
+function render(){
+  const p=PLOTS[current];
+  document.getElementById('title').textContent=p.name+' — '+p.where;
+
+  document.getElementById('listings').innerHTML=Object.entries(PLOTS).map(([k,v])=>
+    '<div class="listing'+(k===current?' on':'')+'" data-k="'+k+'"><div class="thumb"></div>'+
+    '<div><b>'+v.name+'</b><span>'+v.where+'</span><span>'+v.size+'</span>'+
+    '<div class="p">'+v.price+'</div></div></div>').join('');
+  document.querySelectorAll('.listing').forEach(e=>e.onclick=()=>{current=e.dataset.k;
+    activeUse=PLOTS[current].best||'residential'; activeTab=0; render();});
+
+  drawMap(p);
+
+  // ---- score gauge -------------------------------------------------------
+  const has=Object.keys(p.scores).length>0;
+  const s=has?p.scores[activeUse]:null;
+  const arc=document.getElementById('arc'), C=389.6;
+  arc.style.strokeDashoffset=has?C-(C*s/100):C;
+  arc.setAttribute('stroke',has?band(s)[1]:'var(--line)');
+  document.getElementById('gscore').textContent=has?s:'—';
+  document.getElementById('glabel').textContent=has?band(s)[0]:'Not rated';
+  document.getElementById('uses').innerHTML=has?Object.keys(NAME).map(u=>
+    '<button class="'+(u===activeUse?'on':'')+'" data-u="'+u+'">'+NAME[u]+'</button>').join(''):'';
+  document.querySelectorAll('.usebtn button').forEach(b=>b.onclick=()=>{activeUse=b.dataset.u;render();});
+  document.getElementById('gtext').textContent = has
+    ? 'Best suited to '+NAME[p.best].toLowerCase()+' use. The score weighs flood risk, ground, access and services — the full report shows what each contributed.'
+    : (p.blocked==='protected'
+       ? 'We will not score land that our data places inside a protected area. A score would invite a comparison that should not be made.'
+       : 'We will not score a plot whose boundary we cannot confirm. Every number would describe the wrong ground.');
+  document.getElementById('gconf').textContent=p.conf;
+
+  // ---- key insights ------------------------------------------------------
+  document.getElementById('insights').innerHTML=
+    insight('Flood risk',p.flood.v,p.flood.c)+
+    insight('Road access',p.road.v,p.road.c)+
+    insight('Water point',p.water.v,p.water.c)+
+    insight('Mobile mast',p.mast.v,p.mast.c)+
+    insight('Mobile coverage',p.cov.v,p.cov.c)+
+    insight('Electricity','Not yet checked','unk')+
+    insight('Land use zone','Not yet checked','unk')+
+    insight('Title status','Not checked by us','unk');
+
+  // ---- nearby ------------------------------------------------------------
+  document.getElementById('nearby').innerHTML=p.near.map(n=>{const d=dist(n[1]);
+    return '<div class="ins"><span class="k">'+n[0]+'</span><span class="v">'+d.a+
+      (d.b?'<span style="display:block;font-weight:400;font-size:11.5px;color:var(--ink-3)">'+d.b+'</span>':'')+
+      '</span></div>';}).join('');
+
+  // ---- tabs --------------------------------------------------------------
+  document.getElementById('tabs').innerHTML=TABS.map((t,i)=>
+    '<button class="'+(i===activeTab?'on':'')+'" data-i="'+i+'">'+t+'</button>').join('');
+  document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{activeTab=+b.dataset.i;render();});
+
+  const P=[];
+  P[0]='<div class="facts">'+
+    fact('Plot size',p.size)+fact('Price',p.price)+fact('Location',p.where)+
+    fact('Title status','Not checked by us')+'</div>'+
+    '<div class="chips">'+
+    chip(p.flood.v+' flood risk',p.flood.c)+
+    chip(p.riparian?'River reserve on plot':'No river reserve',p.riparian?'w':'g')+
+    chip(p.protected?'Inside protected area':'Not protected',p.protected?'w':'g')+
+    chip('Zoning not checked','u')+chip('Title not checked','u')+'</div>'+
+    '<div class="note"><b>What this page is.</b> Every figure here is measured from '+
+    'satellite imagery, terrain, rainfall records and public datasets. Nobody from our '+
+    'team has visited this plot. It is not a valuation, and it says nothing about who '+
+    'owns the land.</div>';
+
+  P[1]=has
+    ? '<h4>Score by intended use</h4>'+Object.keys(NAME).map(u=>
+        '<div class="rowline"><span class="k">'+NAME[u]+'</span><span class="v '+
+        (p.scores[u]>=75?'good':p.scores[u]>=55?'warn':'bad')+'">'+p.scores[u]+' / 100</span></div>').join('')+
+      '<div class="note"><b>Why four scores and not one.</b> Land is bought for a purpose. '+
+      'The Kano plains parcel scores 89 to farm and 35 to build on — averaging those would '+
+      'describe no buyer. The headline score is the best of the four, and it names the use.</div>'+
+      '<div class="note"><b>The weighting is our judgement, not a measurement.</b> The '+
+      'components are measured; how much each one matters is an opinion we publish in the '+
+      'full report so you can disagree with it.</div>'
+    : '<div class="note"><b>This plot is not scored.</b> '+
+      document.getElementById('gtext').textContent+'</div>';
+
+  P[2]='<h4>Distance to the nearest of each</h4>'+p.near.map(n=>{const d=dist(n[1]);
+    return '<div class="rowline"><span class="k">'+n[0]+'</span><span class="v">'+d.a+
+      (d.b?' · '+d.b:'')+'</span></div>';}).join('')+
+    '<div class="note"><b>Straight-line distance</b> to the nearest mapped feature — not '+
+    'road distance. Health facilities are recorded at the centre of their ward rather than '+
+    'their exact building, so treat those as approximate.</div>';
+
+  P[3]=p.risks.map(r=>'<div class="rowline"><span class="k">'+r[0]+'</span>'+
+    '<span class="v '+r[2]+'">'+r[1]+'</span></div>'+
+    '<p style="margin:0 0 12px;font-size:13.5px;color:var(--ink-2)">'+r[3]+'</p>').join('')+
+    '<div class="note"><b>Flood risk is modelled from the shape of the land</b>, not from '+
+    'flood records. It cannot see a broken dike or a blocked drain. Ask neighbours how high '+
+    'the water came in the last heavy season — they will know better than any map.</div>';
+
+  P[4]='<div class="rowline"><span class="k">Mobile coverage in this area</span>'+
+    '<span class="v good">'+p.cov.v+'</span></div>'+
+    '<div class="rowline"><span class="k">Nearest mast</span><span class="v">'+p.mast.v+'</span></div>'+
+    '<div class="note"><b>Coverage is measured for the wider area</b>, not for this plot. '+
+    'It means "the area around this plot is well covered", which is not a promise of signal '+
+    'at the gate. The mast distance is the plot-specific half of the answer.</div>'+
+    pending('electricity')+pending('piped');
+
+  P[5]=pending('title')+pending('zoning')+
+    '<div class="note"><b>What we do not do.</b> We do not search the Lands registry, '+
+    'confirm ownership, or mark boundaries on the ground. Those are jobs for your advocate '+
+    'and a licensed surveyor, and no amount of satellite data replaces them.</div>';
+
+  document.getElementById('panes').innerHTML=TABS.map((t,i)=>
+    '<div class="tabpane'+(i===activeTab?'':' off')+'">'+P[i]+'</div>').join('');
+}
+function fact(k,v){return '<div class="fact"><h4>'+k+'</h4><b>'+v+'</b></div>';}
+function chip(t,c){return '<span class="chip '+c[0]+'">'+t+'</span>';}
+function pending(k){const d=PENDING[k];
+  return '<div class="pending"><b>'+d.label+' — not yet available</b>'+d.why+
+    '<div style="margin-top:6px;color:var(--ink-3)">'+d.interim+'</div></div>';}
+
+document.getElementById('theme').onclick=function(){
+  const l=document.documentElement.getAttribute('data-theme')==='light';
+  document.documentElement.setAttribute('data-theme',l?'dark':'light');
+  this.textContent=l?'Light':'Dark';};
+render();
+</script>
+</body>
+</html>

@@ -1,0 +1,83 @@
+# ===========================================================================
+# WHAT DOES NOT GO INTO VERSION CONTROL
+# Land Intelligence Platform - Geocode Spatial Solutions Ltd
+#
+# The repository holds the things that took twelve sessions to write and
+# cannot be re-downloaded: the ETL scripts, the enrichment engine, the
+# verifiers, the migrations, the delivery layer, and the documents that are
+# the durable record.
+#
+# It does NOT hold data that can be fetched again, anything large enough to
+# make the history unusable, or the database password.
+# ===========================================================================
+
+# --- THE PASSWORD. This line matters more than the rest of the file. ------
+# 03_etl/.env holds DB_PASSWORD in plain text. Every script reads it from
+# there. A commit that includes it publishes it, and rewriting history does
+# not un-publish anything - once pushed, treat the password as burned and
+# change it. .env.example is the template and IS tracked.
+.env
+*.env
+!.env.example
+
+# --- Re-downloadable. Large. Not ours. ------------------------------------
+# 06_rasters is the raster corpus - CHIRPS, SoilGrids, WorldCover, GHSL,
+# VIIRS, the DEM. Tens of gigabytes, all of it public and all of it fetchable
+# again. The recovery shopping list is the .rasters.csv written beside every
+# backup by backup_01_full.ps1; that is what makes re-fetching possible, not
+# storing the files here.
+06_rasters/
+03_etl/data/
+
+# --- Machine-local, rebuildable in one command ----------------------------
+03_etl/venv/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# --- Database dumps. Backups, not source. ---------------------------------
+# These belong on an external drive and in cloud storage - not in a git
+# history, where they would bloat every clone forever.
+*.dump
+*.sql.gz
+*.backup
+
+# --- Editor and OS noise --------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*~
+
+# --- QGIS working files ---------------------------------------------------
+# The project files themselves are worth keeping; their autosave and lock
+# files are not.
+*.qgz~
+*.qgs~
+*~.qgs
+.qgis2/
+
+# ===========================================================================
+# DELIBERATELY TRACKED, in case someone is tempted to add them here
+#
+#   *.bak                 the ETL .bak files are the ONLY history this
+#                         project has ever had. Once git exists they become
+#                         redundant, but they are small text and they are
+#                         evidence. Keep them until the history is deep
+#                         enough to replace them.
+#
+#   _live_schema_snapshot.sql
+#                         197 KB of text and the whole point of the E10
+#                         check. Its value is entirely in being diffable
+#                         against the previous version, which is what a
+#                         repository is for.
+#
+#   02_data_catalogue/datasets.csv
+#                         every source, licence and ETL status. This is the
+#                         licence position in one file - the thing an
+#                         acquirer asks for.
+#
+#   04_docs/correspondence/
+#                         the five drafted letters. What was asked of whom
+#                         and when is a legal record.
+# ===========================================================================
