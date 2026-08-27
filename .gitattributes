@@ -1,0 +1,41 @@
+# ===========================================================================
+# LINE ENDINGS AND BINARY FILES
+# Land Intelligence Platform - Geocode Spatial Solutions Ltd
+#
+# The first commit printed a CRLF warning for all 165 files. Harmless once,
+# and a real problem later: without this, a file saved by a different editor
+# can flip its line endings and show up as EVERY LINE CHANGED. The one thing
+# version control is for here is seeing what actually changed between
+# sessions, and a diff that says "1,400 lines changed" when someone fixed a
+# typo is no diff at all.
+#
+# text=auto stores everything with LF in the repository and checks it out
+# with CRLF on Windows. Nothing about how the files look on disk changes.
+# ===========================================================================
+
+* text=auto
+
+# Binary. Never diffed, never line-ending-converted - conversion would
+# corrupt them.
+*.qgz    binary
+*.kmz    binary
+*.kml    binary
+*.pdf    binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.tif    binary
+*.tiff   binary
+*.xlsx   binary
+*.zip    binary
+*.dump   binary
+
+# Explicitly text, so they diff properly whatever an editor does to them.
+*.py     text
+*.sql    text
+*.md     text
+*.csv    text
+*.js     text
+*.html   text
+*.ps1    text
+*.yml    text

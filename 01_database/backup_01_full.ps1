@@ -184,10 +184,29 @@ if ($PGRESTORE) {
 # The recovery shopping list. Rasters are files on disk, not rows.
 if ($PSQL) {
     Write-Host "-- writing the raster catalogue (files this dump does NOT contain)"
-    $q = "COPY (SELECT raster_id, variable, path, status, temporal_start FROM metadata.raster_catalog ORDER BY raster_id) TO STDOUT WITH CSV HEADER"
-    & $PSQL -U $DBUSER -h $DBHOST -p $DBPORT -d $DBNAME -c $q | Out-File -FilePath $csv -Encoding utf8
-    if (Test-Path $csv) {
-        $n = (Get-Content $csv | Measure-Object -Line).Lines - 1
+    # storage_url, NOT path. The first version of this line guessed `path`
+    # because the engine reads e["path"] - but that key is built in Python
+    # from a SELECT that names the column storage_url. The dump succeeded and
+    # the recovery list silently did not, which is the worst way for a backup
+    # to be wrong: it looks finished.
+    #
+    # Every status is included, not just 'active'. A quarantined raster
+    # (landcover_change at pending_review) still has to be re-fetched to get
+    # back to where we are.
+    $q = "COPY (SELECT raster_id, variable, storage_url, status, temporal_start FROM metadata.raster_catalog ORDER BY raster_id) TO STDOUT WITH CSV HEADER"
+    & $PSQL -U $DBUSER -h $DBHOST -p $DBPORT -d $DBNAME -v ON_ERROR_STOP=1 -c $q |
+        Out-File -FilePath $csv -Encoding utf8
+    $n = if (Test-Path $csv) { (Get-Content $csv | Measure-Object -Line).Lines - 1 } else { -1 }
+    if ($LASTEXITCODE -ne 0 -or $n -lt 1) {
+        # LOUD, because a silent failure here is invisible until recovery day.
+        # The dump is still good - only the shopping list is missing.
+        Write-Host "   *** RASTER CATALOGUE NOT WRITTEN ***" -ForegroundColor Red
+        Write-Host "   The database dump above is fine. What is missing is the" -ForegroundColor Red
+        Write-Host "   list of raster files it does NOT contain, which is what" -ForegroundColor Red
+        Write-Host "   you would need to rebuild the workbench. Fix before" -ForegroundColor Red
+        Write-Host "   relying on this backup." -ForegroundColor Red
+        if (Test-Path $csv) { Remove-Item $csv -Force }
+    } else {
         Write-Host "   wrote $([System.IO.Path]::GetFileName($csv))  ($n raster(s) referenced)"
     }
 }

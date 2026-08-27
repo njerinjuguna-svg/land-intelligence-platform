@@ -41,6 +41,18 @@
 *.dump
 *.sql.gz
 *.backup
+geocode-backups/
+
+# --- Generated reports ----------------------------------------------------
+# 06_delivery/out holds PDFs produced by pdf_01_report.py. They are OUTPUT -
+# rebuildable from the database in one command - and several of them are a
+# real client's plots. Generated deliverables carrying client data do not
+# belong in a source history, where they are permanent and travel with every
+# clone.
+#
+# The first commit included twenty of them. To untrack without deleting:
+#     git rm -r --cached 06_delivery/out
+06_delivery/out/
 
 # --- Editor and OS noise --------------------------------------------------
 .vscode/
