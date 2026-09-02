@@ -1,6 +1,6 @@
 r"""
 ============================================================================
-EMBED API v0.1 — the endpoint a client's website calls
+EMBED API v0.1 - the endpoint a client's website calls
 Land Intelligence Platform - Geocode Spatial Solutions Ltd
 
 WHAT A CLIENT INTEGRATES. Two lines in their page:
@@ -18,7 +18,7 @@ WHY AN EMBED AND NOT AN API OF THE DATA
 
     embed widget      client receives nothing; it renders from our server
     API of values     numbers only
-    API of geometry   this IS conveyance — the highest exposure there is
+    API of geometry   this IS conveyance - the highest exposure there is
 
   So the widget is the product and the geometry never crosses the boundary.
   `report_content.assert_no_geometry()` enforces that on every response,
@@ -29,7 +29,7 @@ THE ONE REAL INTEGRATION POINT IS PLOT IDENTITY
   agreed at onboarding and it is where the conversation with their developer
   actually happens. Serving the wrong plot's analysis to a buyer is the worst
   failure this product has, so the lookup is scoped to the calling company and
-  an unknown ref is a 404 — never a nearest match, never a guess.
+  an unknown ref is a 404 - never a nearest match, never a guess.
 
 RUN IT
   pip install fastapi uvicorn
@@ -39,7 +39,9 @@ RUN IT
 """
 
 import os
+import re
 import sys
+import json
 import time
 import hashlib
 from datetime import datetime, timezone
@@ -60,18 +62,96 @@ except ImportError:
     sys.exit("ERROR: pip install fastapi uvicorn")
 
 BASE = Path(__file__).resolve().parent
-ENV_DIR = BASE.parent / "03_etl"
 API_VERSION = "0.1.0"
 
-load_dotenv(ENV_DIR / ".env")
+# THIS FILE'S OWN .env FIRST, and the reason is the whole security boundary.
+#
+# Until now this read 03_etl/.env unconditionally - the ETL's file, holding
+# the postgres superuser. DEPLOY.md said to `cp .env.example .env` here, and
+# 06_delivery/.env.example carried the landiq_api grants, and NOTHING READ IT.
+# Creating the confined user, granting it exactly eight privileges and proving
+# it could not write would all have been decoration: the widget would still
+# have connected as a superuser, and the tunnel would have put that superuser
+# on the public internet.
+#
+# 03_etl/.env stays as the fallback so the enrichment tools are unaffected,
+# and the choice is announced at startup rather than assumed.
+_LOCAL_ENV = BASE / ".env"
+_ETL_ENV = BASE.parent / "03_etl" / ".env"
+
+if _LOCAL_ENV.exists():
+    load_dotenv(_LOCAL_ENV)
+    ENV_DIR, _ENV_FILE = BASE, _LOCAL_ENV
+else:
+    load_dotenv(_ETL_ENV)
+    ENV_DIR, _ENV_FILE = _ETL_ENV.parent, _ETL_ENV
+    print(f"WARNING: no {_LOCAL_ENV} - falling back to {_ETL_ENV}, which is "
+          f"the ETL's credentials. Copy .env.example to .env and point it at "
+          f"landiq_api before exposing this API.", file=sys.stderr)
+
+print(f"[config] credentials from {_ENV_FILE}", file=sys.stderr)
+
 _pw = os.getenv("DB_PASSWORD")
 if not _pw or _pw == "put_your_password_here":
-    sys.exit(f"ERROR: set DB_PASSWORD in {ENV_DIR / '.env'}")
+    sys.exit(f"ERROR: set DB_PASSWORD in {_ENV_FILE}")
 engine = create_engine(
     f"postgresql+psycopg2://{os.getenv('DB_USER','postgres')}:{_pw}"
     f"@{os.getenv('DB_HOST','localhost')}:{os.getenv('DB_PORT','5432')}"
     f"/{os.getenv('DB_NAME','land_intelligence_kenya')}",
     pool_pre_ping=True)
+
+
+def _refuse_superuser():
+    """A control, not a warning. The API will not start as a superuser.
+
+    This is the one component reachable from the public internet. There is no
+    configuration in which it legitimately needs to be able to rewrite a
+    parcel, drop a table, or read the staging schema - grants_landiq_api.sql
+    exists precisely so it cannot.
+
+    A warning here would be a reminder, and the failure mode it guards against
+    is silent: everything works exactly as well with the wrong credentials,
+    right up until it doesn't.
+    """
+    try:
+        with engine.connect() as conn:
+            who, sup = conn.execute(text(
+                "SELECT current_user, "
+                "(SELECT rolsuper FROM pg_roles WHERE rolname = current_user)"
+            )).one()
+    except Exception as e:                                # noqa: BLE001
+        sys.exit(f"ERROR: cannot reach the database using {_ENV_FILE}: {e}")
+
+    if sup:
+        sys.exit(
+            f"\nREFUSING TO START.\n\n"
+            f"  Connected as '{who}', which is a SUPERUSER, using {_ENV_FILE}.\n"
+            f"  This API is the one component reachable from the internet and\n"
+            f"  it must not hold credentials that can rewrite the database.\n\n"
+            f"  Fix:\n"
+            f"    psql -U postgres -d land_intelligence_kenya "
+            f"-f ../01_database/grants_landiq_api.sql\n"
+            f"    copy 06_delivery/.env.example to 06_delivery/.env\n"
+            f"    set DB_USER=landiq_api and its password there\n")
+    print(f"[config] connected as '{who}' (not a superuser)", file=sys.stderr)
+
+
+_refuse_superuser()
+
+# Say plainly whether the imagery will work. The widget falls back to a
+# neutral placeholder when the key is missing, which is right on a client's
+# page and useless to the person configuring it - "no pictures" looks
+# identical whether the key is absent, in the wrong file, or added after the
+# API was already running. The API reads its configuration ONCE, at startup.
+_gk = (os.getenv("GOOGLE_MAPS_KEY") or "").strip()
+if _gk:
+    print(f"[config] Google Maps key: set ({_gk[:6]}...{_gk[-4:]}, "
+          f"{len(_gk)} chars) - satellite and scheme map enabled",
+          file=sys.stderr)
+else:
+    print(f"[config] Google Maps key: NOT SET in {_ENV_FILE} - the widget "
+          f"will show a placeholder where the pictures go. Add "
+          f"GOOGLE_MAPS_KEY=... to that file and RESTART.", file=sys.stderr)
 
 app = FastAPI(title="Geocode LandIQ embed API", version=API_VERSION)
 
@@ -128,7 +208,7 @@ def loader():
 
 
 # ---------------------------------------------------------------------------
-# Auth. The key is never stored — only its hash.
+# Auth. The key is never stored - only its hash.
 # ---------------------------------------------------------------------------
 def authenticate(raw_key):
     """-> (auth dict, None) on success, or (None, reason) on refusal.
@@ -189,7 +269,7 @@ def client_ip(request):
     """-> a value the `inet` column will accept, or None.
 
     logs.api_logs.ip_address is typed `inet`, and request.client.host is NOT
-    always an IP address — it is 'testclient' under FastAPI's test client, and
+    always an IP address - it is 'testclient' under FastAPI's test client, and
     behind a proxy it can be whatever the hop reports. Postgres rejects the
     row, which took the whole usage log down with it on the first run.
 
@@ -262,7 +342,7 @@ PARCEL_SQL = text("""
        AND p.status = 'active'
      LIMIT 1
 """)
-# `i.*` would carry p.geom if the join brought it — it does not, because
+# `i.*` would carry p.geom if the join brought it - it does not, because
 # parcel_intelligence holds no geometry column. assert_no_geometry() is the
 # backstop for the day somebody adds one.
 #
@@ -270,7 +350,7 @@ PARCEL_SQL = text("""
 # then splats a table holding a column of the same name; the row is keyed BY
 # NAME, the duplicate collapses, and the LAST one wins. In the PDF generator
 # that silently sourced the plot size from parcel_intelligence instead of
-# land.parcels, and every report printed no acreage at all — no error, no
+# land.parcels, and every report printed no acreage at all - no error, no
 # warning, just an absent line. Same query shape, same bug, fixed here before
 # it could serve a wrong size to a buyer. Nothing to the left of a `.*` goes
 # unaliased.
@@ -334,7 +414,7 @@ def guard(raw_key, request):
         # ONE message outward, ALWAYS. The reason is printed, never returned.
         # If this string ever varies by cause it becomes an oracle telling an
         # attacker which keys are real.
-        print(f"   ! 401 {request.url.path} — {why}")
+        print(f"   ! 401 {request.url.path} - {why}")
         log_call(None, request, 401, 0)
         raise HTTPException(401, AUTH_REFUSED)
     return auth
@@ -342,7 +422,7 @@ def guard(raw_key, request):
 
 @app.get("/v1/plots/{ref}")
 def plot_json(ref: str, request: Request, x_api_key: str = Header(None)):
-    """The report as data. Values only — never geometry."""
+    """The report as data. Values only - never geometry."""
     t0 = time.time()
     auth = guard(x_api_key, request)
     rep = fetch(auth["company_id"], ref)
@@ -383,7 +463,9 @@ def plot_embed(ref: str, request: Request, x_api_key: str = Header(None)):
              WHERE company_id = :c LIMIT 1"""),
             {"c": auth["company_id"]}).one_or_none()
     log_call(auth, request, 200, ms)
-    return HTMLResponse(listing_html(rep, b[0] if b and b[0] else ""))
+    return HTMLResponse(listing_html(rep, b[0] if b and b[0] else "",
+                                     api_key=x_api_key,
+                                     company_id=auth["company_id"]))
 
 
 TONE_COLOR = {"yes": "#0ca30c", "careful": "#fab219", "no": "#d03b3b",
@@ -496,6 +578,253 @@ def scheme_rows(company_id, project):
              "size": acres(r[3])} for r in rows]
 
 
+# ===========================================================================
+# THE INDEX - EVERY PLOT IN A SCHEME, AS CARDS
+#
+# The seller now embeds TWO things: this on their scheme page, and the plot
+# widget on each plot page. One line each, same key.
+#
+# WHY THE CARD SHOWS THE BEST USE AND NOT JUST THE NUMBER
+#   Lesson 42, carried over from the report header. TEST-KANO-01 scores 89
+#   overall while its residential score is CAPPED AT 35, because much of it
+#   is in the highest flood categories. A card reading "89 - Good" on a page
+#   of plots is precisely the skim-read the report guards against, and a grid
+#   is nothing BUT skim-reading. So the use travels with the number, always.
+#
+# WHY BLOCKED PLOTS SHOW NO NUMBER AT ALL
+#   Same rule as the scorer: a blocked parcel comes back with NULL scores and
+#   a reason, never a low number, because a low number invites a comparison
+#   that must not be made. On a card that means "Not rated" and nothing else.
+# ===========================================================================
+
+INDEX_SQL = text("""
+    SELECT p.parcel_ref, p.project_name, p.listing_status, p.price_kes,
+           p.area_sqm, s.overall_score,
+           (s.score_breakdown ->> 'best_use') AS best_use
+      FROM land.parcels p
+      LEFT JOIN analytics.suitability_scores s
+             ON s.parcel_id = p.parcel_id AND s.status = 'active'
+     WHERE p.company_id = :cid AND p.status = 'active'
+       AND p.listing_status NOT IN ('hidden', 'cancelled')
+       AND (:proj = '' OR p.project_name = :proj)
+     ORDER BY p.project_name NULLS LAST, p.parcel_ref
+     LIMIT 200""")
+
+USE_WORDS = {"residential": "a home", "agricultural": "farming",
+             "commercial": "business", "investment": "investment"}
+
+
+def index_rows(company_id, project=""):
+    with engine.connect() as conn:
+        rows = conn.execute(INDEX_SQL,
+                            {"cid": company_id, "proj": project or ""}).all()
+    from report_content import STATUS_WORDS, acres
+    out = []
+    for ref, proj, state, price, area, score, best in rows:
+        v = float(score) if score is not None else None
+        out.append({
+            "ref": ref,
+            "project": proj,
+            "state": state,
+            "status": STATUS_WORDS.get(state, state),
+            "price": (f"KSh {float(price):,.0f}" if price else None),
+            "size": acres(area),
+            "score": None if v is None else round(v),
+            "label": (None if v is None else
+                      "Good" if v >= 75 else "Fair" if v >= 55 else "Poor"),
+            "use": USE_WORDS.get(best, best) if best else None,
+        })
+    return out
+
+
+# One-character labels, because that is all a Google static map marker will
+# carry. 1-9 then A-Z gets 35 plots onto a map; past that the markers stay
+# and the labels go, since an unlabelled pin is honest and a wrong one is not.
+def _marker_label(n):
+    if n < 9:
+        return str(n + 1)
+    if n < 35:
+        return chr(ord("A") + n - 9)
+    return None
+
+
+def _scheme_points(company_id, project):
+    """[(ref, lon, lat)] in the SAME ORDER as index_rows.
+
+    The order is the whole contract between the map and the cards: marker 3
+    is card 3. Both queries sort by project then parcel_ref for that reason,
+    and neither may be reordered without the other.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT parcel_ref, ST_X(ST_Centroid(geom)), ST_Y(ST_Centroid(geom))
+              FROM land.parcels
+             WHERE company_id = :cid AND status = 'active'
+               AND listing_status NOT IN ('hidden', 'cancelled')
+               AND (:proj = '' OR project_name = :proj)
+             ORDER BY project_name NULLS LAST, parcel_ref
+             LIMIT 200"""),
+            {"cid": company_id, "proj": project or ""}).all()
+    return [(r[0], float(r[1]), float(r[2])) for r in rows]
+
+
+def _scheme_map_bytes(company_id, project):
+    """A satellite map of the whole scheme, numbered.
+
+    No center and no zoom: Google fits the view to the markers, which is
+    exactly right for a scheme whose extent we would otherwise have to
+    compute and would get wrong on the one scheme that straggles.
+
+    Like every other picture here, the server fetches it and streams the
+    bytes - the plots' coordinates never reach a browser.
+    """
+    if not GOOGLE_KEY:
+        return None
+    pts = _scheme_points(company_id, project)
+    if not pts:
+        return None
+
+    marks = []
+    for n, (_ref, lon, lat) in enumerate(pts):
+        lab = _marker_label(n)
+        style = "size:mid|color:0x1b5e43"
+        if lab:
+            style += f"|label:{lab}"
+        marks.append(f"markers={style}|{lat},{lon}")
+
+    url = ("https://maps.googleapis.com/maps/api/staticmap"
+           "?size=640x330&scale=2&maptype=hybrid&"
+           + "&".join(marks) + f"&key={GOOGLE_KEY}")
+
+    # A URL this long is the real limit here, not the plot count. Google
+    # rejects requests past about 16,000 characters, so a very large scheme
+    # drops back to unlabelled pins, and past that it is simply not mapped.
+    if len(url) > 15500:
+        return None
+
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", project or "all")[:40]
+    return _cached_image(f"scheme_{slug}_{len(pts)}.jpg", url)
+
+
+@app.get("/v1/scheme/map")
+def scheme_map(request: Request, project: str = "", k: str = None,
+               x_api_key: str = Header(None)):
+    auth = guard(x_api_key or k, request)
+    got = _scheme_map_bytes(auth["company_id"], project)
+    if not got:
+        raise HTTPException(404, "No map for this scheme.")
+    return Response(content=got[0], media_type=got[1],
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+def index_html(rows, api_key="", project="", company_id=None):
+    if not rows:
+        return ('<div class="giq"><div class="slot">'
+                'No plots are listed here yet.</div></div>')
+
+    o = ['<div class="giq giq-ix"><style>', CSS, '</style>']
+    open_n = sum(1 for r in rows if r["state"] == "available")
+    head = esc(project) if project else "All plots"
+    o.append(f'<div class="hd"><div><h3>{head}</h3>'
+             f'<p class="loc">{open_n} of {len(rows)} available</p></div></div>')
+
+    # THE MAP GOES FIRST. A buyer looking at a scheme wants to know where the
+    # plots are before anything else, and the numbers on the pins are what
+    # tie the picture to the list underneath.
+    if GOOGLE_KEY and company_id is not None:
+        if _scheme_map_bytes(company_id, project):
+            q = f"?k={esc(api_key)}" if api_key else "?"
+            if project:
+                q += f"&project={esc(project)}"
+            # Clicking opens Google Maps centred on the scheme, where a buyer
+            # can pan, zoom and switch to the road map. Centred on the first
+            # plot, because that is the scheme's own ordering and any
+            # computed centroid of a straggling scheme lands in a field.
+            pts = _scheme_points(company_id, project)
+            open_link = ""
+            if pts:
+                _r, lon0, lat0 = pts[0]
+                open_link = (f'<a class="smapo" href="{esc(_gmaps_view(lat0, lon0))}" '
+                             f'target="_blank" rel="noopener noreferrer">'
+                             f'Open in Google Maps</a>')
+            o.append(f'<div class="smap"><img loading="lazy" '
+                     f'alt="Map of the plots in this scheme" '
+                     f'src="/v1/scheme/map{q}">'
+                     f'<div class="smapc">Numbers match the list below'
+                     f'{open_link}</div></div>')
+
+    o.append('<div class="grid">')
+    for n, r in enumerate(rows):
+        gone = "" if r["state"] == "available" else " gone"
+        # data-giq-plot is what the loader listens for. A card is a button,
+        # not a link: there is no URL on the seller's site we could guess,
+        # and inventing one would break their page.
+        o.append(f'<button class="card{gone}" type="button" '
+                 f'data-giq-plot="{esc(r["ref"])}">')
+        lab = _marker_label(n)
+        pin = f'<span class="pin">{lab}</span>' if lab else ""
+        o.append(f'<span class="cref">{pin}{esc(r["ref"])}</span>')
+        o.append(f'<span class="pill{gone}">{esc(r["status"])}</span>')
+        bits = [x for x in (r["size"], r["price"]) if x]
+        if bits:
+            o.append(f'<span class="cmeta">{esc(" · ".join(bits))}</span>')
+        if r["score"] is None:
+            o.append('<span class="cscore none">Not rated</span>')
+        else:
+            use = f' · best for {esc(r["use"])}' if r["use"] else ""
+            o.append(f'<span class="cscore"><b>{r["score"]}</b> '
+                     f'{esc(r["label"])}{use}</span>')
+        o.append('</button>')
+    o.append('</div>')
+    o.append('<div class="ixf">Tap a plot to see what the land is.</div>')
+    o.append('</div>')
+    return "".join(o)
+
+
+DEMO_PAGE = BASE / "demo_page.html"
+
+
+@app.get("/demo", response_class=HTMLResponse)
+def demo(k: str = ""):
+    """A stand-in seller's page, served from this origin.
+
+    It exists so that testing needs no file editing. Because the page comes
+    from the same host as the widget, its script tag is a relative path and
+    the tunnel hostname - which changes on every restart - is never written
+    into a file. The same URL works on localhost and through the tunnel.
+
+    The key arrives in the query string and is echoed into the page, escaped.
+    That is not a hole: it is the key the page would carry anyway, and it is
+    checked on every widget call exactly as it always is. Nothing here is
+    authenticated, because nothing here is data - it is scenery around two
+    empty divs.
+    """
+    if not DEMO_PAGE.exists():
+        raise HTTPException(404, "demo_page.html is missing.")
+    if not k:
+        return HTMLResponse(
+            "<pre style='font:14px/1.6 monospace;padding:28px'>"
+            "Add an API key to the address.\n\n"
+            "  /demo?k=pk_test_...\n\n"
+            "Mint one with:  python mint_key.py --company \"ZZ TEST\""
+            "</pre>", status_code=400)
+    html = DEMO_PAGE.read_text(encoding="utf-8").replace("{{KEY}}", esc(k))
+    return HTMLResponse(html)
+
+
+@app.get("/v1/scheme/embed", response_class=HTMLResponse)
+def scheme_embed(request: Request, project: str = "", k: str = None,
+                 x_api_key: str = Header(None)):
+    """Every plot this key can see, as a grid. The scheme-page half."""
+    t0 = time.time()
+    auth = guard(x_api_key or k, request)
+    rows = index_rows(auth["company_id"], project)
+    ms = int((time.time() - t0) * 1000)
+    log_call(auth, request, 200, ms)
+    return HTMLResponse(index_html(rows, x_api_key or k or "", project,
+                                   auth["company_id"]))
+
+
 CSS = """
 .giq{--ink:#16201b;--dim:#5c6a62;--line:#e2e6e0;--bg:#fff;--soft:#f4f7f4;
  --brand:#1b5e43;--brandsoft:#e7f0ea;--warn:#a85e24;
@@ -531,6 +860,55 @@ CSS = """
 .giq .r b{font-weight:500}
 .giq .slot{background:var(--soft);border-top:1px solid var(--line);
  padding:26px 20px;text-align:center;color:var(--dim);font-size:13px}
+.giq .imgs{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));
+ gap:1px;background:var(--line);border-top:1px solid var(--line)}
+.giq .imgs .tile{display:block;margin:0;background:var(--bg);position:relative;
+ text-decoration:none;color:inherit}
+.giq .imgs img{display:block;width:100%;height:auto;aspect-ratio:16/9;
+ object-fit:cover;background:var(--soft)}
+.giq .imgs .cap{position:absolute;left:0;bottom:0;right:0;
+ display:flex;justify-content:space-between;align-items:center;gap:10px;
+ padding:7px 11px;font-size:11px;letter-spacing:.05em;text-transform:uppercase;
+ color:#fff;background:linear-gradient(transparent,rgba(0,0,0,.68))}
+.giq .imgs .cap em{font-style:normal;font-weight:600;opacity:.85;
+ white-space:nowrap}
+.giq .imgs .tile:hover .cap em{text-decoration:underline;opacity:1}
+.giq .imgs .tile:focus-visible{outline:2px solid var(--brand);outline-offset:-2px}
+.giq .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));
+ gap:1px;background:var(--line)}
+.giq .card{display:grid;gap:5px;text-align:left;background:var(--bg);
+ border:0;padding:15px 17px 17px;font:inherit;color:inherit;cursor:pointer;
+ transition:background .12s}
+.giq .card:hover{background:var(--soft)}
+.giq .card:focus-visible{outline:2px solid var(--brand);outline-offset:-2px}
+.giq .card .cref{font-weight:650;font-size:15.5px;letter-spacing:-.01em}
+.giq .card .cmeta{font-size:13px;color:var(--dim)}
+.giq .card .cscore{font-size:13px;color:var(--dim);margin-top:3px}
+.giq .card .cscore b{font-size:17px;color:var(--brand);font-weight:700}
+.giq .card .cscore.none{font-style:italic}
+.giq .card.gone{opacity:.62}
+.giq .card .pill{justify-self:start}
+.giq .ixf{padding:11px 20px;font-size:12px;color:var(--dim);
+ border-top:1px solid var(--line);background:var(--soft)}
+.giq .smap{position:relative;border-top:1px solid var(--line);
+ border-bottom:1px solid var(--line);background:var(--soft)}
+.giq .smap img{display:block;width:100%;height:auto;aspect-ratio:64/33;
+ object-fit:cover}
+.giq .smapc{position:absolute;left:0;right:0;bottom:0;padding:7px 12px;
+ display:flex;justify-content:space-between;align-items:center;gap:10px;
+ font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:#fff;
+ background:linear-gradient(transparent,rgba(0,0,0,.66))}
+.giq .smapo{color:#fff;font-weight:600;text-decoration:none;white-space:nowrap;
+ opacity:.9}
+.giq .smapo:hover{text-decoration:underline;opacity:1}
+.giq .card .pin{display:inline-flex;align-items:center;justify-content:center;
+ width:20px;height:20px;margin-right:8px;border-radius:50%;
+ background:var(--brand);color:#fff;font-size:11.5px;font-weight:700;
+ vertical-align:middle}
+.giq .back{display:inline-flex;align-items:center;gap:6px;background:none;
+ border:0;font:inherit;font-size:13.5px;font-weight:600;color:var(--brand);
+ cursor:pointer;padding:12px 20px}
+.giq .back:hover{text-decoration:underline}
 .giq .acts{display:flex;gap:9px;flex-wrap:wrap;padding:14px 20px;
  border-top:1px solid var(--line)}
 .giq .acts a{font-size:13.5px;font-weight:600;text-decoration:none;
@@ -561,7 +939,266 @@ def esc(v):
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def listing_html(rep, footer=""):
+# ===========================================================================
+# SATELLITE AND STREET VIEW
+#
+# WHY THE SERVER FETCHES THESE AND THE BROWSER NEVER SEES A COORDINATE
+#
+#   The obvious way to put a satellite image on a page is an <img> pointing
+#   at Google with the parcel's latitude and longitude in the URL. That would
+#   publish the parcel's position into a page we do not control, which is
+#   exactly what rules A4/B4 forbid and what assert_no_geometry() exists to
+#   prevent. A point is geometry.
+#
+#   So the browser asks US for /v1/plots/<ref>/satellite, we look the
+#   coordinate up server-side, fetch the picture from Google, and stream back
+#   the bytes. The client receives a JPEG. The coordinate never leaves this
+#   process, and the same firewall that governs the values governs the
+#   imagery.
+#
+# WHY THE IMAGES ARE CACHED ON DISK
+#
+#   Google bills per request. A widget on a busy listing page would otherwise
+#   bill once per page view, forever, for a picture of ground that does not
+#   move. Cached by parcel_ref, and a parcel's position is not a thing that
+#   changes - if it did, the parcel is superseded and gets a new id anyway.
+#
+# WHY THE KEY TRAVELS IN THE QUERY STRING HERE
+#
+#   An <img> tag cannot send an X-API-Key header. The embed key is already
+#   public - it sits in the client's page source, which is what an embed key
+#   IS - so putting it in an image URL discloses nothing new. It is still
+#   checked exactly as the other endpoints check it, and rate limiting will
+#   cover both when it is built.
+# ===========================================================================
+
+GOOGLE_KEY = (os.getenv("GOOGLE_MAPS_KEY") or "").strip()
+IMG_CACHE = BASE / "cache" / "img"
+IMG_TIMEOUT = 12
+
+SAT_URL = ("https://maps.googleapis.com/maps/api/staticmap"
+           "?center={lat},{lon}&zoom=17&size=640x360&scale=2"
+           "&maptype=satellite&key={key}")
+SV_URL = ("https://maps.googleapis.com/maps/api/streetview"
+          "?location={lat},{lon}&size=640x360&fov=80&key={key}")
+SV_META = ("https://maps.googleapis.com/maps/api/streetview/metadata"
+           "?location={lat},{lon}&key={key}")
+
+
+def _parcel_point(company_id, ref):
+    """(lon, lat) of the parcel centroid. NEVER returned to a caller."""
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT ST_X(ST_Centroid(geom)), ST_Y(ST_Centroid(geom))
+              FROM land.parcels
+             WHERE company_id = :c AND parcel_ref = :r AND status = 'active'
+             LIMIT 1"""), {"c": company_id, "r": ref}).one_or_none()
+    return (float(row[0]), float(row[1])) if row else None
+
+
+def _http_get(url):
+    """-> (body, content_type). Raises, but with GOOGLE'S OWN WORDS attached.
+
+    urllib raises HTTPError on a 4xx and the message is "HTTP Error 403:
+    Forbidden", which says nothing. Google puts the actual reason in the
+    RESPONSE BODY - "billing has not been enabled", "this API project is not
+    authorized to use this API", "the provided API key is expired" - and that
+    sentence is the whole diagnosis. Throwing it away turns a five-second fix
+    into an afternoon.
+    """
+    import urllib.request
+    import urllib.error
+    try:
+        with urllib.request.urlopen(url, timeout=IMG_TIMEOUT) as r:
+            return r.read(), r.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace").strip()[:400]
+        except Exception:                                     # noqa: BLE001
+            pass
+        raise RuntimeError(f"HTTP {e.code} from Google - {detail or e.reason}")
+
+
+def _cached_image(name, url):
+    """-> (bytes, content_type) or None. Disk first, Google once."""
+    IMG_CACHE.mkdir(parents=True, exist_ok=True)
+    path = IMG_CACHE / name
+    if path.exists() and path.stat().st_size > 0:
+        return path.read_bytes(), "image/jpeg"
+    try:
+        body, ctype = _http_get(url)
+    except Exception as e:                                    # noqa: BLE001
+        print(f"[imagery] fetch failed for {name}: {e}", file=sys.stderr)
+        return None
+    # Google answers some errors with a 200 and a tiny image saying so, and
+    # others with plain text. Anything this small is not a photograph and must
+    # not be cached as one - but print what came back, because that is the
+    # only place the reason exists.
+    if len(body) < 2000:
+        peek = body[:300].decode("utf-8", "replace").replace("\n", " ")
+        print(f"[imagery] {name}: only {len(body)} bytes, not an image. "
+              f"Google said: {peek!r}", file=sys.stderr)
+        return None
+    path.write_bytes(body)
+    return body, ctype or "image/jpeg"
+
+
+def _streetview_ok(ref, lat, lon):
+    """Does Street View actually cover this spot?
+
+    Most Kenyan land for sale is not on a Street View road, and Google
+    answers that with a grey 'no imagery' placeholder rather than an error.
+    Putting that on a client's listing looks broken. The metadata endpoint is
+    free and answers the question properly, so it is asked first and the
+    answer is cached beside the images.
+    """
+    if not GOOGLE_KEY:
+        return False
+    IMG_CACHE.mkdir(parents=True, exist_ok=True)
+    flag = IMG_CACHE / f"{ref}.sv.txt"
+    if flag.exists():
+        return flag.read_text().strip() == "OK"
+    try:
+        body, _ = _http_get(SV_META.format(lat=lat, lon=lon, key=GOOGLE_KEY))
+        status = json.loads(body.decode()).get("status", "")
+    except Exception as e:                                    # noqa: BLE001
+        print(f"[imagery] street view metadata failed: {e}", file=sys.stderr)
+        return False
+    flag.write_text(status)
+    return status == "OK"
+
+
+def _img_endpoint(ref, company_id, kind):
+    pt = _parcel_point(company_id, ref)
+    if not pt or not GOOGLE_KEY:
+        return None
+    lon, lat = pt
+    if kind == "satellite":
+        return _cached_image(f"{ref}.sat.jpg",
+                             SAT_URL.format(lat=lat, lon=lon, key=GOOGLE_KEY))
+    if not _streetview_ok(ref, lat, lon):
+        return None
+    return _cached_image(f"{ref}.sv.jpg",
+                         SV_URL.format(lat=lat, lon=lon, key=GOOGLE_KEY))
+
+
+@app.get("/v1/plots/{ref}/satellite")
+def plot_satellite(ref: str, request: Request, k: str = None,
+                   x_api_key: str = Header(None)):
+    auth = guard(x_api_key or k, request)
+    got = _img_endpoint(ref, auth["company_id"], "satellite")
+    if not got:
+        raise HTTPException(404, "No satellite image for this plot.")
+    return Response(content=got[0], media_type=got[1],
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/v1/plots/{ref}/streetview")
+def plot_streetview(ref: str, request: Request, k: str = None,
+                    x_api_key: str = Header(None)):
+    auth = guard(x_api_key or k, request)
+    got = _img_endpoint(ref, auth["company_id"], "streetview")
+    if not got:
+        raise HTTPException(404, "No street view for this plot.")
+    return Response(content=got[0], media_type=got[1],
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+# ---------------------------------------------------------------------------
+# LINKING OUT TO GOOGLE MAPS, AND WHY THAT IS NOT A BREACH OF B4
+#
+# A static tile cannot pan or zoom, and "Get directions" cannot work, unless
+# the plot's coordinate reaches the browser. Rule B4 - ship values and
+# pictures, never geometry - is why the images are proxied through this
+# server in the first place.
+#
+# The rule's PURPOSE is ODbL. Checklist A4 is about OpenStreetMap-derived
+# layers, above all environment.riparian_buffers, which is derived geometry
+# and therefore unambiguously a database. Hand a client those and we have
+# conveyed a database; share-alike attaches. That has not changed and must
+# not.
+#
+# A CLIENT'S OWN PARCEL CENTROID IS NOT THAT. They drew it, they sent us the
+# KMZ, they publish the location themselves, and they run site visits to it
+# every Saturday. Withholding a plot's position from the buyers of that plot
+# protects nothing and breaks the single thing a land listing exists to do.
+#
+# So the line is drawn where the exposure actually is:
+#
+#   our derived layers      NEVER leave. Unchanged, enforced by
+#                           assert_no_geometry() on every payload.
+#   the pictures            still fetched server-side and streamed, so no
+#                           coordinate is needed to display them.
+#   the client's own point  used to build an outbound Google Maps link.
+#
+# Everything interactive therefore happens in Google Maps proper - which is
+# better than a cramped iframe, opens the Maps app on a phone, and costs
+# nothing, because the Embed and directions URLs are not billed.
+# ---------------------------------------------------------------------------
+def _gmaps_view(lat, lon):
+    return (f"https://www.google.com/maps/@?api=1&map_action=map"
+            f"&center={lat:.6f},{lon:.6f}&zoom=18&basemap=satellite")
+
+
+def _gmaps_dir(lat, lon):
+    return (f"https://www.google.com/maps/dir/?api=1"
+            f"&destination={lat:.6f},{lon:.6f}")
+
+
+def _imagery_html(ref, api_key, company_id):
+    """The picture panel, or an honest placeholder."""
+    if not GOOGLE_KEY:
+        return ('<div class="slot">Satellite view and Street View appear here '
+                'once a Google Maps key is configured.</div>')
+    pt = _parcel_point(company_id, ref) if ref else None
+    if not pt:
+        return ""
+    lon, lat = pt
+    q = f"?k={esc(api_key)}" if api_key else ""
+    view = esc(_gmaps_view(lat, lon))
+
+    tiles = [f'<a class="tile" href="{view}" target="_blank" '
+             f'rel="noopener noreferrer">'
+             f'<img loading="lazy" alt="Satellite view of this plot" '
+             f'src="/v1/plots/{esc(ref)}/satellite{q}">'
+             f'<span class="cap">Satellite view '
+             f'<em>Open in Google Maps</em></span></a>']
+    if _streetview_ok(ref, lat, lon):
+        sv = esc(f"https://www.google.com/maps/@?api=1&map_action=pano"
+                 f"&viewpoint={lat:.6f},{lon:.6f}")
+        tiles.append(f'<a class="tile" href="{sv}" target="_blank" '
+                     f'rel="noopener noreferrer">'
+                     f'<img loading="lazy" alt="Street view near this plot" '
+                     f'src="/v1/plots/{esc(ref)}/streetview{q}">'
+                     f'<span class="cap">Nearest street view '
+                     f'<em>Walk around it</em></span></a>')
+    return '<div class="imgs">' + "".join(tiles) + '</div>'
+
+
+def _actions_html(ref, company_id):
+    """Get directions, for real this time.
+
+    On a phone this opens the Google Maps app with the plot as destination
+    and the buyer's own position as origin, which is exactly what somebody
+    reading a land listing on a matatu is trying to do.
+    """
+    pt = _parcel_point(company_id, ref) if ref else None
+    o = ['<div class="acts">']
+    if pt:
+        lon, lat = pt
+        o.append(f'<a class="p" href="{esc(_gmaps_dir(lat, lon))}" '
+                 f'target="_blank" rel="noopener noreferrer">Get directions</a>')
+    # "Book a site visit" stays inert until a client tells us where it should
+    # go - their form, their WhatsApp, their phone. Inventing a destination
+    # would be worse than an obvious placeholder, and clients.branding is
+    # where it will live.
+    o.append('<a href="#">Book a site visit</a>')
+    o.append('</div>')
+    return "".join(o)
+
+
+def listing_html(rep, footer="", api_key="", company_id=None):
     o = ['<div class="giq"><style>', CSS, '</style>']
 
     # ---- header: identity, and the score if this plot has one -------------
@@ -628,9 +1265,21 @@ def listing_html(rep, footer=""):
     if net.get("has_2g"):
         net_rows.append({"what": "Calls and SMS", "travel": "Available",
                          "spelled": "in this area"})
-    if net.get("mast"):
-        net_rows.append({"what": "Nearest mast", "travel": "",
-                         "spelled": net["mast"]})
+    # "Nearest mast - 1.0 km away" is REMOVED from the seller's page.
+    #
+    # Rule D4 pairs the sublocation coverage percentage with dist_tower_m
+    # because the percentage is an area figure and the mast is the
+    # point-specific half. That reasoning is about not overclaiming coverage,
+    # and it is satisfied by the wording already used - "Available - in this
+    # area" says plainly that it is an area statement.
+    #
+    # What the mast row added was a distance to a crowd-estimated OpenCellID
+    # position, at confidence 2, which no land buyer can act on. They want to
+    # know whether their phone will work. A number they cannot use, carrying a
+    # caveat they will not read, is not more honest - it is just more.
+    #
+    # The value stays in the database and in the PDF report, where the reader
+    # has paid for depth.
 
     cols = (col("Access", rep.get("access"))
             + col("Amenities nearby", rep.get("amenities"))
@@ -640,11 +1289,8 @@ def listing_html(rep, footer=""):
         o.append('<div class="cols">' + cols + '</div>')
 
     # ---- imagery + actions -------------------------------------------------
-    o.append('<div class="slot">Satellite view and Street View appear here '
-             'once a Google Maps key is configured.</div>')
-    o.append('<div class="acts">'
-             '<a class="p" href="#">Get directions</a>'
-             '<a href="#">Book a site visit</a></div>')
+    o.append(_imagery_html(rep.get("ref"), api_key, company_id))
+    o.append(_actions_html(rep.get("ref"), company_id))
 
     # ---- the rest of the scheme -------------------------------------------
     sch = rep.get("scheme") or []

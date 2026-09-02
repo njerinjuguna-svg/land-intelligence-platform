@@ -58,17 +58,41 @@ SKIP_SUFFIX = {".dump", ".backup", ".gz", ".zip", ".tif", ".tiff", ".img",
                ".shp", ".dbf", ".shx", ".png", ".jpg", ".jpeg", ".pdf",
                ".xlsx", ".pyc", ".qgz", ".gpkg"}
 
-PATTERNS = [
+# Assignments. Group 2 captures the opening quote, if any - see NEEDS_QUOTE.
+ASSIGNMENTS = [
     (re.compile(r'(?i)\b(db_password|password|passwd|pwd)\s*[=:]\s*'
-                r'["\']?([^\s"\';,#]{6,})'), "password assignment"),
+                r'(["\']?)([^\s"\';,#]{6,})'), "password assignment"),
     (re.compile(r'(?i)\b(api_key|apikey|secret|token|access_key|client_secret)'
-                r'\s*[=:]\s*["\']?([^\s"\';,#]{8,})'), "key assignment"),
-    (re.compile(r'\bpk_live_[A-Za-z0-9]{6,}'), "live embed key"),
+                r'\s*[=:]\s*(["\']?)([^\s"\';,#]{8,})'), "key assignment"),
+]
+
+# Self-identifying. These are credentials whatever surrounds them.
+LITERALS = [
+    (re.compile(r'\bpk_live_[A-Za-z0-9_-]{6,}'), "live embed key"),
     (re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----'), "private key block"),
     (re.compile(r'\bAKIA[0-9A-Z]{16}\b'), "AWS access key id"),
+    (re.compile(r'\bAIza[0-9A-Za-z_-]{30,}'), "Google API key"),
     (re.compile(r'postgres(?:ql)?(?:\+\w+)?://[^:\s/]+:[^@\s]+@'),
      "connection string with inline password"),
 ]
+
+# IN SOURCE CODE, AN UNQUOTED VALUE CANNOT BE A CREDENTIAL.
+#
+# The first version of this flagged `api_key=x_api_key` in api_01_embed.py -
+# a Python keyword argument passing a variable. It saw `api_key=` followed by
+# eight characters and never asked whether those characters were a STRING.
+#
+# You cannot write an unquoted string literal in Python or JavaScript. So in
+# these files a credential is necessarily quoted, and an unquoted value is an
+# identifier, a number or an expression.
+#
+# In .env, .ini, .cfg and .yml the opposite holds: unquoted IS the normal way
+# to write a value, and DB_PASSWORD=Nj3ri!Geocode2026 must still be caught.
+# So the rule is per file type, not global - which is why a scanner that
+# cried wolf on one line does not get "fixed" by loosening the pattern.
+NEEDS_QUOTE = {".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".java", ".rb",
+               ".go", ".ps1", ".psm1", ".sql", ".c", ".cpp", ".cs", ".php",
+               ".sh", ".bash", ".cmd", ".bat"}
 
 # A value that is obviously not a real credential.
 PLACEHOLDER = re.compile(
@@ -83,19 +107,27 @@ def looks_interpolated(text):
                                    "..."))
 
 
-def scan_line(line):
+def scan_line(line, suffix=""):
     hits = []
-    for rx, label in PATTERNS:
+
+    for rx, label in LITERALS:
+        m = rx.search(line)
+        if m and not looks_interpolated(m.group(0)):
+            hits.append((label, m.group(0)))
+
+    for rx, label in ASSIGNMENTS:
         m = rx.search(line)
         if not m:
             continue
-        whole = m.group(0)
+        whole, quote, value = m.group(0), m.group(2), m.group(3)
         if looks_interpolated(whole):
             continue
-        value = m.group(m.lastindex) if m.lastindex and m.lastindex > 1 else whole
-        if PLACEHOLDER.match(str(value).strip("\"'")):
+        if not quote and suffix in NEEDS_QUOTE:
+            continue                      # an identifier, not a string
+        if PLACEHOLDER.match(value.strip("\"'")):
             continue
         hits.append((label, whole))
+
     return hits
 
 
@@ -157,7 +189,7 @@ def main():
         for n, line in enumerate(text.splitlines(), 1):
             if len(line) > 2000:
                 continue
-            for label, snippet in scan_line(line):
+            for label, snippet in scan_line(line, p.suffix.lower()):
                 findings.append((p, n, label, snippet.strip()[:110]))
 
     bad = False

@@ -35,6 +35,23 @@
 *.pyc
 *.pyo
 
+# Downloaded binaries - cloudflared and anything like it. A 30 MB executable
+# in a git history is there forever and travels with every clone.
+*.exe
+cloudflared.exe
+
+# Scratch API responses from testing.
+plot.json
+embed.html
+
+# Cached Google imagery. Re-fetchable, billed per fetch, and a picture of a
+# client's plot is their data - it does not belong in a source history.
+06_delivery/cache/
+
+# Throwaway test page. It carries a live API key and a tunnel hostname that
+# changes every restart - a key in a tracked file is a key in the history.
+06_delivery/tunnel_test.html
+
 # --- Database dumps. Backups, not source. ---------------------------------
 # These belong on an external drive and in cloud storage - not in a git
 # history, where they would bloat every clone forever.

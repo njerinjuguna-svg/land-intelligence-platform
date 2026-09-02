@@ -75,9 +75,68 @@
    * listing showing four plots is a real case and must not need four
    * script tags. */
   var targets = document.querySelectorAll(
-    "#geocode-plot, [data-geocode-plot], .geocode-plot");
+    "#geocode-plot, [data-geocode-plot], .geocode-plot, " +
+    "#geocode-scheme, [data-geocode-scheme]");
 
   if (!targets.length) { warn("no container found on the page."); return; }
+
+  /* ------------------------------------------------------------------
+   * Fetching. One function, because the two modes differ only in URL and
+   * every failure path below is identical for both.
+   * ------------------------------------------------------------------ */
+  function load(path, what) {
+    return fetch(origin + path, {
+      method: "GET",
+      headers: { "X-API-Key": key },
+      credentials: "omit",
+      /* No cookies, ever. This runs on a client's domain and a credentialed
+       * cross-origin request would drag their session into our logs. */
+      cache: "no-store"
+    }).then(function (res) {
+      if (res.status === 404) {
+        /* An unknown reference is a 404 and NEVER a nearest match - that
+         * rule lives in the API and this is the client-side half of it.
+         * Serving the wrong plot's analysis to a buyer is the worst
+         * failure this product has, so an unrecognised plot renders
+         * nothing at all. */
+        throw { quiet: true, msg: what + " is not in this account. Check the "
+              + "parcel_ref mapping agreed at onboarding." };
+      }
+      if (res.status === 401 || res.status === 403) {
+        throw { quiet: true, msg: "API key rejected. If the key is correct, "
+              + "the account may be inactive - contact Geocode." };
+      }
+      if (res.status === 429) {
+        throw { quiet: true, msg: "rate limit reached for this account." };
+      }
+      if (!res.ok) throw { quiet: true, msg: "server returned " + res.status };
+      return res.text();
+    });
+  }
+
+  /* The server sends a self-contained fragment with its own scoped styles.
+   * It is inserted as HTML because that is the entire point of the embed
+   * model - we render, they display.
+   *
+   * NOTE FOR WHOEVER TOUCHES THIS NEXT: this is safe only because the
+   * response comes from our own origin over TLS and is built by
+   * report_content.py from database values. It is NOT safe to widen this to
+   * any other source, and nothing here should ever interpolate anything the
+   * host page supplies. */
+  function put(el, html) {
+    el.innerHTML = html;
+    el.setAttribute("data-geocode-state", "ready");
+    el.setAttribute("data-geocode-version", VERSION);
+  }
+
+  function fail(el, err) {
+    /* Leave the container empty and the page intact. The client's layout
+     * closes over the gap and their buyer sees a listing without an
+     * analysis panel, rather than a broken one. */
+    el.innerHTML = "";
+    el.setAttribute("data-geocode-state", "error");
+    warn((err && err.msg) || (err && err.message) || "request failed");
+  }
 
   Array.prototype.forEach.call(targets, function (el) {
     if (el.getAttribute("data-geocode-state")) return;   // already handled
@@ -86,70 +145,72 @@
     var ref = el.getAttribute("data-plot-ref")
            || el.getAttribute("data-geocode-plot");
 
-    if (!ref) {
+    /* SCHEME MODE. The attribute may be present and empty, which means
+     * "every plot this key can see" - so its presence is tested, not its
+     * value. A seller with one scheme should not have to type its name. */
+    var isScheme = el.hasAttribute("data-scheme")
+                || el.hasAttribute("data-geocode-scheme")
+                || el.id === "geocode-scheme";
+
+    if (!ref && !isScheme) {
       /* THE ONE LOUD FAILURE. Everything else in this file fails quietly,
        * because a broken widget on a live page should disappear rather than
        * embarrass the client. This one is different: it means the plot
        * reference was never wired up, it will affect EVERY plot on the site,
        * and it is a five-minute fix during integration and a disaster after
        * go-live. Their developer needs to see it. */
-      warn("container has no data-plot-ref. The widget cannot know which "
-         + "plot to show. Add data-plot-ref=\"<your plot reference>\".");
+      warn("container has no data-plot-ref and is not a scheme container. "
+         + "Add data-plot-ref=\"<your plot reference>\" for one plot, or "
+         + "data-scheme for the whole scheme.");
       el.setAttribute("data-geocode-state", "misconfigured");
       return;
     }
 
-    var url = origin + "/v1/plots/" + encodeURIComponent(ref) + "/embed";
+    if (isScheme) {
+      var project = el.getAttribute("data-scheme")
+                 || el.getAttribute("data-geocode-scheme") || "";
+      var indexPath = "/v1/scheme/embed"
+                    + (project ? "?project=" + encodeURIComponent(project) : "");
+      var indexHtml = null;
 
-    fetch(url, {
-      method: "GET",
-      headers: { "X-API-Key": key },
-      credentials: "omit",
-      /* No cookies, ever. This runs on a client's domain and a credentialed
-       * cross-origin request would drag their session into our logs. */
-      cache: "no-store"
-    })
-      .then(function (res) {
-        if (res.status === 404) {
-          /* An unknown reference is a 404 and NEVER a nearest match - that
-           * rule lives in the API and this is the client-side half of it.
-           * Serving the wrong plot's analysis to a buyer is the worst
-           * failure this product has, so an unrecognised plot renders
-           * nothing at all. */
-          throw { quiet: true, msg: "plot '" + ref + "' is not in this "
-                + "account. Check the parcel_ref mapping agreed at onboarding." };
+      /* Clicking a card swaps the detail in. Delegated from the container,
+       * once, so it survives every re-render - binding per card would leak a
+       * listener each time the index comes back. */
+      el.addEventListener("click", function (ev) {
+        var card = ev.target && ev.target.closest
+                 ? ev.target.closest("[data-giq-plot]") : null;
+        if (card && el.contains(card)) {
+          showPlot(card.getAttribute("data-giq-plot"));
+          return;
         }
-        if (res.status === 401 || res.status === 403) {
-          throw { quiet: true, msg: "API key rejected. If the key is correct, "
-                + "the account may be inactive - contact Geocode." };
+        var back = ev.target && ev.target.closest
+                 ? ev.target.closest("[data-giq-back]") : null;
+        if (back && el.contains(back) && indexHtml !== null) {
+          put(el, indexHtml);                 /* instant: no second request */
+          if (el.scrollIntoView) el.scrollIntoView({ block: "nearest" });
         }
-        if (res.status === 429) {
-          throw { quiet: true, msg: "rate limit reached for this account." };
-        }
-        if (!res.ok) throw { quiet: true, msg: "server returned " + res.status };
-        return res.text();
-      })
-      .then(function (html) {
-        /* The server sends a self-contained fragment with its own scoped
-         * styles. It is inserted as HTML because that is the entire point of
-         * the embed model - we render, they display.
-         *
-         * NOTE FOR WHOEVER TOUCHES THIS NEXT: this is safe only because the
-         * response comes from our own origin over TLS and is built by
-         * report_content.py from database values. It is NOT safe to widen
-         * this to any other source, and nothing here should ever interpolate
-         * anything the host page supplies. */
-        el.innerHTML = html;
-        el.setAttribute("data-geocode-state", "ready");
-        el.setAttribute("data-geocode-version", VERSION);
-      })
-      .catch(function (err) {
-        /* Leave the container empty and the page intact. The client's layout
-         * closes over the gap and their buyer sees a listing without an
-         * analysis panel, rather than a broken one. */
-        el.innerHTML = "";
-        el.setAttribute("data-geocode-state", "error");
-        warn((err && err.msg) || (err && err.message) || "request failed");
       });
+
+      function showPlot(plotRef) {
+        if (!plotRef) return;
+        load("/v1/plots/" + encodeURIComponent(plotRef) + "/embed",
+             "plot '" + plotRef + "'")
+          .then(function (html) {
+            put(el, '<div class="giq"><button class="back" type="button" '
+                  + 'data-giq-back>&#8592; All plots</button></div>' + html);
+            if (el.scrollIntoView) el.scrollIntoView({ block: "nearest" });
+          })
+          .catch(function (err) { fail(el, err); });
+      }
+
+      load(indexPath, "this scheme")
+        .then(function (html) { indexHtml = html; put(el, html); })
+        .catch(function (err) { fail(el, err); });
+      return;
+    }
+
+    load("/v1/plots/" + encodeURIComponent(ref) + "/embed", "plot '" + ref + "'")
+      .then(function (html) { put(el, html); })
+      .catch(function (err) { fail(el, err); });
   });
 })();

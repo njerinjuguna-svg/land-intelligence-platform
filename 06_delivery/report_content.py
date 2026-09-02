@@ -1,6 +1,6 @@
 r"""
 ============================================================================
-REPORT CONTENT — the single source of truth for what we SAY about a parcel
+REPORT CONTENT - the single source of truth for what we SAY about a parcel
 Land Intelligence Platform - Geocode Spatial Solutions Ltd
 
 WHY THIS MODULE EXISTS AT ALL
@@ -27,7 +27,6 @@ WHAT THIS MODULE WILL NOT DO
 """
 
 import json
-import math
 import re
 
 # Anything shaped like geometry must never leave the building. Checked, not
@@ -64,7 +63,7 @@ def assert_no_geometry(payload, path="payload"):
         # NO LENGTH GATE. The first version of this only inspected strings
         # longer than 60 characters, on the reasoning that geometry is bulky.
         # A four-corner MULTIPOLYGON is 57 characters and a small GeoJSON
-        # Polygon is 57 — both walked straight through, and the unit test
+        # Polygon is 57 - both walked straight through, and the unit test
         # below caught it on the first run.
         #
         # An arbitrary threshold inside a guard is how the guard stops being
@@ -89,7 +88,7 @@ FLOOD_WORD = {"very_low": "very low", "low": "low", "moderate": "some",
 SURE = {4: "We're confident about this.",
         3: "We're fairly confident about this.",
         2: "Treat this as a rough guide.",
-        1: "We can't be sure — see the checklist."}
+        1: "We can't be sure. See the checklist."}
 
 
 def travel(m):
@@ -175,16 +174,19 @@ def _build(i, blocked):
                           "ground and expect to raise the floor level.",
                     sure=3)
     if slope is not None and float(slope) > 12:
+        # No degree figure. Same reasoning as the ground card: a buyer cannot
+        # do anything with "7.06 degrees", and the sentence already says the
+        # thing that matters.
         return dict(tone="careful", answer="Yes, on a slope",
-                    because=f"The ground averages {slope}°, which is steep "
-                            f"for building.",
+                    because="The ground here is steep enough that building "
+                            "on it costs more than on flat land.",
                     means="Expect cut-and-fill costs, and check where water "
                           "runs during heavy rain.", sure=3)
     return dict(tone="yes", answer="Yes",
                 because="The ground is workable and we found no flooding "
                         "risk and no river reserve on it.",
                 means="You can build here. Still get a soil test and confirm "
-                      "the boundary — see the checklist.", sure=3)
+                      "the boundary. Both are on the checklist.", sure=3)
 
 
 def _farm(i):
@@ -196,15 +198,15 @@ def _farm(i):
                     because="We have no rainfall reading for this plot.",
                     means="Ask locally what grows here.", sure=1)
     if r >= 1200:
-        return dict(tone="yes", answer="Yes — this is good growing land",
+        return dict(tone="yes", answer="Yes, this is good growing land",
                     because=f"Heavy, reliable rain of about {r:,.0f} mm a "
                             f"year.",
                     means="Proper farming land. If it also floods, that is "
-                          "the same water that makes the soil rich — plan for "
+                          "the same water that makes the soil rich. Plan for "
                           "it rather than against it.", sure=3)
     if r >= 800:
         return dict(tone="yes", answer="Yes, for most crops",
-                    because=f"Rain is reliable — about {r:,.0f} mm a year, "
+                    because=f"Rain is reliable, about {r:,.0f} mm a year, "
                             f"enough for maize without irrigation.",
                     means="Good for a kitchen garden, fruit trees or a small "
                           "shamba.", sure=3)
@@ -217,7 +219,7 @@ def _farm(i):
                     means="Drought-hardy crops or grazing. Anything else "
                           "needs a water source.", sure=3)
     return dict(tone="careful", answer="Only with water",
-                because=f"Rain is low — about {r:,.0f} mm a year.",
+                because=f"Rain is low, about {r:,.0f} mm a year.",
                 means="You would need a borehole or a dam for anything "
                       "beyond drought-hardy crops or grazing.", sure=3)
 
@@ -235,7 +237,7 @@ def _flood(i):
                     because="A large part of this plot is in the highest "
                             "flood categories, and so is the land around it.",
                     means="Expect water here in a heavy season. Ask "
-                          "neighbours how high it came last time — they will "
+                          "neighbours how high it came last time. They will "
                           "know better than any map.", sure=3)
     if fc == "moderate":
         return dict(tone="careful", answer="Mostly fine, part of it is not",
@@ -282,7 +284,7 @@ def _grow(i):
 
 
 # ---------------------------------------------------------------------------
-# The checklist — generated from findings, never boilerplate
+# The checklist - generated from findings, never boilerplate
 # ---------------------------------------------------------------------------
 def _checklist(i, withheld):
     out = []
@@ -330,7 +332,7 @@ def _checklist(i, withheld):
     if d is None or float(d) > 5000:
         out.append(("Find out where water will come from",
                     "We found no mapped water point close to this plot."))
-    # Always, and last — these are the ones no dataset can answer.
+    # Always, and last - these are the ones no dataset can answer.
     out.append(("Confirm the boundary with a licensed surveyor",
                 "Our measurements come from maps, not from beacons on the "
                 "ground."))
@@ -512,13 +514,13 @@ def build_report(intel, score=None, parcel=None):
                 # themselves and the PDF produced "Good best suited to
                 # residential use" - no punctuation between the band and the
                 # clause, because each half read fine on its own.
-                "headline": "%.0f / 100 — %s" % (v, label),
+                "headline": "%.0f / 100, %s" % (v, label),
                 "use_line": ("Best for %s." % USE_WORDS[best]
                              if best in USE_WORDS else None),
                 "not_for": warn,
                 "not_for_line": (
                     None if not lead else
-                    "We do not recommend this plot for %s — it scores %.0f "
+                    "We do not recommend this plot for %s. It scores %.0f "
                     "out of 100 for that%s. The reasons are below."
                     % (lead["words"], lead["value"],
                        "" if others <= 0 else
@@ -725,7 +727,7 @@ def _rain_card(i):
         v, n = "Low", ("About {:,.0f} mm a year. Drought-hardy crops, or "
                        "irrigation for anything else.")
     elif mm < 1000:
-        v, n = "Reliable", ("About {:,.0f} mm a year — enough for maize and a "
+        v, n = "Reliable", ("About {:,.0f} mm a year, enough for maize and a "
                             "kitchen garden without irrigation.")
     elif mm < 1500:
         v, n = "Good", ("About {:,.0f} mm a year. Comfortable for most crops.")
@@ -758,43 +760,37 @@ def _flood_card(i):
 
 
 def _ground_card(i):
-    # slope_mean_pct HOLDS DEGREES. The column name predates the layer and is
-    # wrong; field_sources says so on every parcel. The bands below were
-    # authored in degrees and are right - 20 degrees IS very steep - but the
-    # sentence said "About {s} in 100", which is a GRADIENT, and a gradient is
-    # not a degree. The two are only close near zero and diverge fast:
+    # NO NUMBER. slope_mean_pct holds degrees, and this card briefly printed
+    # them as "About {s} in 100" - a gradient, which is a different quantity,
+    # understating 7 degrees as 7 in 100 when it is 12. That was fixed with a
+    # tan() conversion, and then the number was removed entirely, which is the
+    # better answer:
     #
-    #   1.35 deg (Oak Grove)  ->  2 in 100, printed as "1 in 100"
-    #   5.07 deg (Kericho)    ->  9 in 100, printed as "5 in 100"
-    #   7.06 deg (Aberdares)  -> 12 in 100, printed as "7 in 100"
+    #   "About 9 in 100" is now CORRECT and still means nothing to a buyer
+    #   standing on a plot in Juja. Correct and meaningless is meaningless.
     #
-    # So the steepest ground we hold was being described to a buyer as a
-    # little over half as steep as it is, on the one card that tells him what
-    # groundwork will cost. Nothing could catch it: the stored value is
-    # correct, the band is correct, and only the sentence is wrong - which is
-    # E14 exactly, and why this card is read by a person once a session.
+    # What a buyer is asking is whether it costs more to build here, and the
+    # band answers that. The degrees stay in the database for the scorer, the
+    # PDF and anyone who asks; they do not go on a seller's page.
     #
-    # tan() converts once, here. The other reader of this field in this file
-    # prints the degree symbol and needs no conversion.
+    # Worth remembering as a general rule: precision the reader cannot use is
+    # not rigour, it is clutter that looks like rigour.
     s = i.get("slope_mean_pct")
     if s is None:
         return None
     s = float(s)
-    grade = math.tan(math.radians(s)) * 100.0
     if s < 2:
         v, n = "Almost flat", "Easy to build on. Check that water drains away."
     elif s < 5:
-        v, n = "Gently sloping", ("About {:.0f} in 100 — easy to build on, and "
-                                  "water runs off rather than sitting.")
+        v, n = "Gently sloping", ("Easy to build on, and water runs off rather "
+                                  "than sitting.")
     elif s < 10:
-        v, n = "Sloping", ("About {:.0f} in 100. Buildable, with some cut and "
-                           "fill.")
+        v, n = "Sloping", "Buildable, with some cut and fill."
     elif s < 20:
-        v, n = "Steep", ("About {:.0f} in 100. Expect real groundwork costs.")
+        v, n = "Steep", "Expect real groundwork costs."
     else:
-        v, n = "Very steep", ("About {:.0f} in 100. Difficult and expensive "
-                              "to build on.")
-    return {"k": "Ground", "v": v, "n": n.format(grade) if "{" in n else n}
+        v, n = "Very steep", "Difficult and expensive to build on."
+    return {"k": "Ground", "v": v, "n": n}
 
 
 # Landmarks a buyer orients by. dist_airport_m is DELIBERATELY ABSENT: it is
