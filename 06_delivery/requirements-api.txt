@@ -6,3 +6,12 @@ uvicorn[standard]==0.34.0
 sqlalchemy==2.0.36
 psycopg2-binary==2.9.10
 python-dotenv==1.0.1
+
+# Draws the plot boundaries and their numbers onto the scheme map. Google
+# Static Maps can draw a path but cannot put text inside one, so the overlay
+# is composited here - which is also what keeps the parcel coordinates out of
+# the browser (A4/B4).
+#
+# NOT a hard requirement: without it the scheme map falls back to numbered
+# pins and logs why. The widget never fails for want of a picture.
+Pillow==11.1.0

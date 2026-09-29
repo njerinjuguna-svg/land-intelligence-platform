@@ -12,68 +12,180 @@
   Served by the API itself at /demo?k=<key>. That matters: because it is
   served from the same origin as the widget, the script tag can be a plain
   relative path and NOTHING in this file has to be edited when the tunnel
-  hostname changes. Open it on localhost or through the tunnel - the same
+  hostname changes. Open it on localhost or through the tunnel and the same
   file works for both, unchanged.
 
   {{KEY}} is filled in from the query string at request time. This file is
   tracked in git precisely because it never contains a real key.
 
-  It is deliberately an ORDINARY page: table layout, Verdana, an inline
-  style block, no build step. If the widget only looks right inside
-  something we designed, it does not work.
+  WHY IT USED TO BE UGLY, AND WHY IT IS NOT ANY MORE
+
+    The first version was deliberately plain - Verdana, a bordered table,
+    grey background - to prove the widget survives an ordinary page rather
+    than only looking right inside something we designed. That test was
+    worth running and it passed.
+
+    But this page is what a prospective client is SHOWN, and a demo that
+    looks like 2003 says the product looks like 2003. So it is now what a
+    competent Kenyan land seller's site actually looks like in 2026.
+
+    THE TEST IT STILL HAS TO PASS: nothing here is arranged around the
+    widget. No shared stylesheet, no CSS variables reaching into it, no
+    layout that the panel depends on. The widget sits in a plain <div> in
+    the normal flow, and it must look right regardless of what surrounds it.
+    KAMAU PROPERTIES IS NOT REAL - an invented seller for a demo, and it
+    should stay obviously invented rather than borrow a real company's name.
   ==========================================================================
 -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&display=swap" rel="stylesheet">
 <style>
-  body { font-family: Verdana, Geneva, sans-serif; background: #f0f0f0;
-         color: #222; margin: 0; padding: 0 0 40px; }
-  .wrap { max-width: 860px; margin: 0 auto; background: #fff; padding: 18px 22px; }
-  .banner { background: #14532d; color: #fff; padding: 14px 22px; }
-  .banner h1 { margin: 0; font-size: 20px; }
-  .price { font-size: 26px; color: #b45309; font-weight: bold; }
-  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
-  td { border: 1px solid #ccc; padding: 6px 8px; font-size: 13px; }
-  td:first-child { background: #fafafa; width: 34%; }
-  .note { font-size: 11px; color: #777; }
-  hr { border: 0; border-top: 1px solid #ddd; margin: 26px 0; }
-  h3 { margin-bottom: 6px; }
+  :root{
+    --ink:#16241c; --muted:#5f7168; --line:#dfe5e0;
+    --green:#14532d; --gold:#b45309; --paper:#fff; --wash:#f6f7f5;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--wash);color:var(--ink);
+       font:16px/1.6 "DM Sans","Segoe UI",Helvetica,Arial,sans-serif;
+       -webkit-font-smoothing:antialiased}
+  a{color:var(--green)}
+
+  /* ---- masthead ---- */
+  .top{background:var(--green);color:#fff}
+  .top .in{max-width:1000px;margin:0 auto;padding:16px 24px;
+           display:flex;align-items:center;gap:13px;flex-wrap:wrap}
+  .mark{display:flex;align-items:center;gap:11px;text-decoration:none;
+        color:#fff}
+  .mark svg{display:block;flex:0 0 auto}
+  .mark b{font-size:19px;font-weight:700;letter-spacing:-.015em;
+          line-height:1.15;display:block}
+  .mark span{font-size:10.5px;letter-spacing:.19em;text-transform:uppercase;
+             color:#a7cbb4;display:block;margin-top:2px}
+  .nav{margin-left:auto;display:flex;gap:22px;font-size:14px}
+  .nav a{color:#cfe3d6;text-decoration:none}
+  .nav a:hover{color:#fff}
+
+  /* ---- hero ---- */
+  .hero{background:var(--paper);border-bottom:1px solid var(--line)}
+  .hero .in{max-width:1000px;margin:0 auto;padding:34px 24px 30px}
+  .crumb{font-size:12.5px;color:var(--muted);letter-spacing:.05em;
+         text-transform:uppercase;margin:0 0 10px}
+  h1{margin:0 0 6px;font-size:38px;line-height:1.1;letter-spacing:-.025em;
+     font-weight:700}
+  .where{margin:0;color:var(--muted);font-size:16px}
+  .row{display:flex;align-items:flex-end;gap:28px;flex-wrap:wrap;
+       margin-top:22px}
+  .price .lab{font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;
+              color:var(--muted);display:block;margin-bottom:2px}
+  .price .val{font-size:31px;font-weight:700;color:var(--gold);
+              letter-spacing:-.02em;line-height:1}
+  .cta{margin-left:auto;display:flex;gap:10px;flex-wrap:wrap}
+  .btn{display:inline-block;padding:12px 21px;border-radius:8px;
+       font-size:14.5px;font-weight:500;text-decoration:none;cursor:pointer;
+       border:1px solid var(--green)}
+  .btn.solid{background:var(--green);color:#fff}
+  .btn.ghost{background:#fff;color:var(--green)}
+
+  .facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+         gap:1px;background:var(--line);border:1px solid var(--line);
+         border-radius:10px;overflow:hidden;margin-top:26px}
+  .facts div{background:var(--paper);padding:14px 16px}
+  .facts dt{font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+            color:var(--muted);margin:0 0 4px}
+  .facts dd{margin:0;font-size:15px;font-weight:500}
+
+  /* ---- body ---- */
+  .wrap{max-width:1000px;margin:0 auto;padding:34px 24px 60px}
+  .card{background:var(--paper);border:1px solid var(--line);border-radius:12px;
+        padding:26px;margin-bottom:22px}
+  h2{margin:0 0 6px;font-size:22px;letter-spacing:-.015em}
+  .sub{margin:0 0 20px;color:var(--muted);font-size:15px}
+  .note{font-size:13.5px;color:var(--muted)}
+  .foot{max-width:1000px;margin:0 auto;padding:0 24px 44px;
+        color:var(--muted);font-size:13px}
 </style>
 </head>
 <body>
-<div class="banner"><h1>Kamau Properties Ltd</h1></div>
+
+<header class="top">
+  <div class="in">
+    <!-- An inline SVG so the demo has no external image to go missing. -->
+    <a class="mark" href="#">
+      <svg width="34" height="34" viewBox="0 0 40 40" aria-hidden="true">
+        <rect width="40" height="40" rx="9" fill="#f4f2ec"/>
+        <path d="M8 25.5 20 9l12 16.5z" fill="#14532d"/>
+        <path d="M20 9 32 25.5H24z" fill="#1f7a44"/>
+        <rect x="8" y="27.5" width="24" height="3.2" rx="1.6" fill="#c99a2e"/>
+      </svg>
+      <span style="display:block">
+        <b>Kamau Properties</b>
+        <span>Land &middot; Juja &middot; Since 2011</span>
+      </span>
+    </a>
+    <nav class="nav">
+      <a href="#">Projects</a>
+      <a href="#">About</a>
+      <a href="#">Contact</a>
+    </nav>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="in">
+    <p class="crumb">Projects / Kiambu County</p>
+    <h1>Oak Grove, Juja</h1>
+    <p class="where">Off Gatundu&ndash;Juja Road, 5 minutes from Juja town</p>
+
+    <div class="row">
+      <div class="price">
+        <span class="lab">Plots from</span>
+        <span class="val">KSh 1,450,000</span>
+      </div>
+      <div class="cta">
+        <a class="btn solid" href="#plots">See available plots</a>
+        <a class="btn ghost" href="tel:+254722000000">Call 0722 000 000</a>
+      </div>
+    </div>
+
+    <dl class="facts">
+      <div><dt>Plot size</dt><dd>1/8 acre</dd></div>
+      <div><dt>Title</dt><dd>Ready title deeds</dd></div>
+      <div><dt>Terms</dt><dd>Cash or 6 months</dd></div>
+      <div><dt>Site visits</dt><dd>Every Saturday</dd></div>
+    </dl>
+  </div>
+</section>
+
 <div class="wrap">
+  <div class="card" id="plots">
+    <h2>Available plots</h2>
+    <p class="sub">Find a plot on the map, then tap it to see what the land
+       is.</p>
 
-  <h2>Oak Grove, Juja</h2>
-  <p class="price">From KSh 1,450,000</p>
+    <!-- ==================================================================
+         THE SCHEME. Map of every plot with its number, then the same plots
+         as a list. Tapping one, on the map or in the list, swaps in that
+         plot's analysis with a way back. This single container is the whole
+         flow, and it is the entire integration.
+         ================================================================== -->
+    <div id="geocode-scheme" data-scheme="OAK GROVE"></div>
+  </div>
 
-  <table>
-    <tr><td>Location</td><td>Juja, Kiambu County</td></tr>
-    <tr><td>Plot sizes</td><td>1/8 acre</td></tr>
-    <tr><td>Title</td><td>Ready title deeds</td></tr>
-    <tr><td>Terms</td><td>Cash or 6 months instalments</td></tr>
-    <tr><td>Contact</td><td>0722 000 000</td></tr>
-  </table>
-
-  <p class="note">Site visits every Saturday. Free transport from town.</p>
-
-  <hr>
-
-  <h3>Our plots</h3>
-  <p class="note">Find a plot on the map, then click it to see what the
-     land is.</p>
-
-  <!-- ======================================================================
-       THE SCHEME. Map of every plot with numbered pins, then the same plots
-       as a list. Clicking one swaps in that plot's analysis, with a way
-       back. This single container is the whole flow.
-       ====================================================================== -->
-  <div id="geocode-scheme" data-scheme="OAK GROVE"></div>
-
-  <hr>
-  <p class="note">&copy; 2026 Kamau Properties Ltd. All rights reserved.</p>
+  <div class="card">
+    <h2>Getting there</h2>
+    <p class="sub">Free transport from town every Saturday morning. Meet at
+       the Total petrol station, Juja, at 9am.</p>
+    <p class="note">Bring your ID. Site visits take about two hours including
+       travel.</p>
+  </div>
 </div>
 
-<!-- ONE script tag serves both containers. Relative src, so the tunnel
-     hostname is never written down anywhere. -->
+<p class="foot">&copy; 2026 Kamau Properties Ltd. A fictional company, used
+   here to demonstrate the plot analysis panel.</p>
+
+<!-- ONE script tag serves every container on the page. Relative src, so the
+     tunnel hostname is never written down anywhere. -->
 <script src="/v1.js" data-key="{{KEY}}"></script>
 </body>
 </html>

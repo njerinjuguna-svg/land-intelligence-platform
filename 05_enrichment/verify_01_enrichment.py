@@ -227,7 +227,10 @@ LANDMARK_IDENTITY = {
     "TEST-RUAI-01": ("nearest_airport_name",
                      "Jomo Kenyatta International Airport",
                      "Ruai sits east of Nairobi; JKIA is the obvious one."),
-    "PLOT-457": ("nearest_intl_airport_name",
+    # Was PLOT-457, which turned out to be a CAD fragment (array position,
+    # not a plot) and was retired when Oak Grove was re-polygonized in
+    # session 14. OG-001 is a real recovered plot on the same ground.
+    "OG-001": ("nearest_intl_airport_name",
                  "Jomo Kenyatta International Airport",
                  "OAK GROVE is at Juja. Every plot in the scheme had "
                  "nearest_airport_name = GSU Airstrip, which is operational, "

@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>PREVIEW for Fusion Estates - Land that moves you</title>
+<!--
+  ==========================================================================
+  PROPOSAL PREVIEW FOR FUSION ESTATES AFRICA - HOME
+  Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+  The front of the mock-up. Clicking Oak Grove City opens the listing page
+  (demo_fusion.html) with the Geocode panel inside it, so the whole journey
+  can be walked in a meeting: their site, their projects, their Oak Grove,
+  and then 688 of their own plots with the analysis attached.
+
+  The key is carried through every internal link, because the widget on the
+  next page needs it and nobody in a meeting should have to paste a URL.
+
+  THE PREVIEW BANNER DOES NOT COME OFF. Same reasoning as the listing page:
+  this carries another company's name, copy and prices, and it will be served
+  over a public URL. Unmarked, it is a copy of a real company's website
+  sitting on the internet. Marked, it is a proposal. See demo_fusion.html.
+
+  Copy, prices and project names are reproduced from Fusion's own live site
+  so the page is recognisably theirs. Nothing about their business is
+  invented here.
+  ==========================================================================
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Jost:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#1c2620; --muted:#66756c; --line:#e2e7e3;
+    --brand:#0f4c2a; --brand2:#15663a; --gold:#c0932e;
+    --paper:#fff; --wash:#f5f7f5;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);
+       font:16px/1.65 Jost,"Segoe UI",Helvetica,Arial,sans-serif;
+       -webkit-font-smoothing:antialiased}
+  a{color:var(--brand)}
+  img{max-width:100%}
+  .in{max-width:1140px;margin:0 auto;padding:0 24px}
+
+  .preview{background:#1c2620;color:#fff;font-size:13.5px;line-height:1.5}
+  .preview .in{padding:11px 24px;display:flex;gap:14px;align-items:center;
+               flex-wrap:wrap}
+  .preview b{color:#ffd97a;font-weight:600;letter-spacing:.04em;
+             text-transform:uppercase;font-size:11.5px;
+             border:1px solid rgba(255,217,122,.45);border-radius:4px;
+             padding:3px 8px;white-space:nowrap}
+  .preview span{color:#c9d4cd}
+
+  .top{background:var(--paper);border-bottom:1px solid var(--line);
+       position:sticky;top:0;z-index:20}
+  .top .in{display:flex;align-items:center;gap:14px;padding-top:14px;
+           padding-bottom:14px;flex-wrap:wrap}
+  .mark{display:flex;align-items:center;gap:11px;text-decoration:none;
+        color:var(--ink)}
+  .mark b{display:block;font-size:19px;font-weight:700;letter-spacing:-.01em}
+  .mark i{display:block;font-style:normal;font-size:10px;color:var(--muted);
+          letter-spacing:.19em;text-transform:uppercase;margin-top:1px}
+  .nav{margin-left:auto;display:flex;gap:19px;font-size:14.5px;
+       align-items:center;flex-wrap:wrap}
+  .nav a{color:var(--muted);text-decoration:none}
+  .nav a:hover{color:var(--brand)}
+  .nav .buy{background:var(--gold);color:#241c05;padding:9px 17px;
+            border-radius:5px;font-weight:600;font-size:13.5px}
+
+  /* hero */
+  .hero{background:linear-gradient(150deg,#0f4c2a 0%,#15663a 62%,#1b7a46 100%);
+        color:#fff;position:relative;overflow:hidden}
+  .hero:after{content:"";position:absolute;right:-120px;top:-90px;width:520px;
+              height:520px;border-radius:50%;background:rgba(192,147,46,.14)}
+  .hero .in{padding:76px 24px 70px;position:relative;z-index:1}
+  .hero .yrs{display:inline-block;border:1px solid rgba(255,255,255,.35);
+             border-radius:40px;padding:5px 15px;font-size:12px;
+             letter-spacing:.13em;text-transform:uppercase;color:#cfe3d6;
+             margin-bottom:20px}
+  .hero h1{margin:0 0 14px;font-size:56px;line-height:1.04;font-weight:700;
+           letter-spacing:-.03em;max-width:13ch}
+  .hero p{margin:0 0 28px;font-size:18.5px;color:#d5e6dc;max-width:52ch}
+  .hbtns{display:flex;gap:12px;flex-wrap:wrap}
+  .btn{display:inline-block;padding:13px 24px;border-radius:6px;
+       font-size:15px;font-weight:500;text-decoration:none;
+       border:1px solid transparent}
+  .btn.solid{background:var(--gold);color:#241c05}
+  .btn.ghost{border-color:rgba(255,255,255,.6);color:#fff}
+
+  .strip{background:var(--brand);color:#cfe3d6;border-top:1px solid #1b6b3c}
+  .strip .in{padding:15px 24px;font-size:14.5px;text-align:center}
+  .strip b{color:#fff;font-weight:600}
+
+  section{padding:62px 0}
+  section.alt{background:var(--wash)}
+  .eyebrow{font-size:11.5px;letter-spacing:.18em;text-transform:uppercase;
+           color:var(--gold);margin:0 0 10px;font-weight:600}
+  h2{margin:0 0 14px;font-size:33px;line-height:1.15;letter-spacing:-.02em}
+  .sub{margin:0 0 34px;color:var(--muted);font-size:17px;max-width:62ch}
+
+  .why{display:grid;gap:20px;
+       grid-template-columns:repeat(auto-fit,minmax(235px,1fr))}
+  .why div{background:var(--paper);border:1px solid var(--line);
+           border-radius:10px;padding:24px}
+  .why h3{margin:0 0 8px;font-size:17.5px}
+  .why p{margin:0;color:var(--muted);font-size:14.5px}
+  .why .ic{width:38px;height:38px;border-radius:9px;background:#eaf3ed;
+           display:flex;align-items:center;justify-content:center;
+           margin-bottom:14px;font-size:19px}
+
+  .props{display:grid;gap:22px;
+         grid-template-columns:repeat(auto-fit,minmax(290px,1fr))}
+  .prop{background:var(--paper);border:1px solid var(--line);border-radius:11px;
+        overflow:hidden;display:flex;flex-direction:column;
+        text-decoration:none;color:inherit}
+  .prop .ph{height:158px;position:relative;
+            background:linear-gradient(135deg,#2f6b46,#8fae72)}
+  .prop .ph.b{background:linear-gradient(135deg,#3b6f7a,#9ec3b4)}
+  .prop .ph.c{background:linear-gradient(135deg,#6b6234,#c2ad76)}
+  .prop .ph.d{background:linear-gradient(135deg,#4a4f55,#9aa4ad)}
+  .prop .pill{position:absolute;top:12px;left:12px;background:#fff;
+              border-radius:4px;padding:4px 10px;font-size:11px;
+              font-weight:600;letter-spacing:.08em;text-transform:uppercase;
+              color:var(--brand)}
+  .prop .pill.out{color:#a33}
+  .prop .bd{padding:19px 20px 22px;flex:1;display:flex;flex-direction:column}
+  .prop h3{margin:0 0 5px;font-size:19px;letter-spacing:-.01em}
+  .prop .loc{margin:0 0 11px;color:var(--muted);font-size:13.5px}
+  .prop .desc{margin:0 0 15px;color:var(--muted);font-size:14px;flex:1}
+  .prop .row{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;
+             border-top:1px solid var(--line);padding-top:13px}
+  .prop .sz{font-size:13px;color:var(--muted)}
+  .prop .pr{margin-left:auto;font-weight:700;color:var(--brand);font-size:17px}
+  .prop.live{border-color:var(--gold);box-shadow:0 0 0 3px rgba(192,147,46,.14)}
+  .prop.live .tagd{background:var(--gold);color:#241c05;font-size:11.5px;
+       font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+       padding:7px 20px}
+
+  .about{display:grid;gap:38px;grid-template-columns:1.15fr .85fr;
+         align-items:center}
+  @media(max-width:820px){.about{grid-template-columns:1fr}}
+  .stats{display:grid;gap:14px;grid-template-columns:1fr 1fr}
+  .stat{background:var(--paper);border:1px solid var(--line);
+        border-radius:10px;padding:20px}
+  .stat b{display:block;font-size:29px;color:var(--brand);line-height:1.1}
+  .stat span{font-size:13px;color:var(--muted)}
+
+  .tst{display:grid;gap:20px;
+       grid-template-columns:repeat(auto-fit,minmax(255px,1fr))}
+  .tst div{background:var(--paper);border:1px solid var(--line);
+           border-radius:10px;padding:22px}
+  .tst p{margin:0 0 14px;font-size:14.5px;color:#3c4a42}
+  .tst b{font-size:14.5px}
+  .tst i{display:block;font-style:normal;font-size:12.5px;color:var(--muted)}
+
+  .news{display:grid;gap:20px;
+        grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+  .news article{border:1px solid var(--line);border-radius:10px;padding:22px;
+                background:var(--paper)}
+  .news .dt{font-size:12px;color:var(--gold);letter-spacing:.09em;
+            text-transform:uppercase;margin:0 0 8px}
+  .news h3{margin:0 0 9px;font-size:18px;line-height:1.3}
+  .news p{margin:0 0 12px;font-size:14px;color:var(--muted)}
+
+  .foot{background:#1c2620;color:#b9c6bf;font-size:14.5px}
+  .foot .in{padding:46px 24px 28px}
+  .foot a{color:#dbe6df;text-decoration:none}
+  .foot a:hover{text-decoration:underline}
+  .cols{display:grid;gap:28px;
+        grid-template-columns:1.5fr 1fr 1fr 1.2fr}
+  @media(max-width:900px){.cols{grid-template-columns:1fr 1fr}}
+  @media(max-width:560px){.cols{grid-template-columns:1fr}}
+  .foot h4{margin:0 0 12px;color:#fff;font-size:13px;letter-spacing:.11em;
+           text-transform:uppercase}
+  .foot ul{margin:0;padding:0;list-style:none}
+  .foot li{margin-bottom:7px}
+  .nl input{width:100%;padding:11px 12px;border-radius:6px;border:0;
+            font:inherit;font-size:14px;margin-bottom:9px}
+  .nl button{background:var(--gold);color:#241c05;border:0;padding:11px 20px;
+             border-radius:6px;font:inherit;font-weight:600;cursor:pointer}
+  .tiny{font-size:12px;color:#8c9b93;margin-top:30px;
+        border-top:1px solid #2c3a33;padding-top:18px}
+</style>
+</head>
+<body>
+
+<div class="preview"><div class="in">
+  <b>Preview</b>
+  <span>A proposal prepared by <strong style="color:#fff">Geocode Spatial
+  Solutions</strong> for Fusion Estates Africa. Not a live Fusion Estates
+  website. Click <strong style="color:#fff">Oak Grove City</strong> to see the
+  proposed plot analysis running on your own project.</span>
+</div></div>
+
+<header class="top"><div class="in">
+  <a class="mark" href="/demo?site=fusion_home&k={{KEY}}">
+    <svg width="38" height="38" viewBox="0 0 40 40" aria-hidden="true">
+      <circle cx="20" cy="20" r="19" fill="#0f4c2a"/>
+      <path d="M20 30c-5-4-8-7.5-8-11.5A8 8 0 0 1 28 18.5C28 22.5 25 26 20 30z"
+            fill="#c0932e"/>
+      <circle cx="20" cy="18.5" r="3.1" fill="#0f4c2a"/>
+    </svg>
+    <span><b>Fusion Estates</b><i>Your land ownership partner</i></span>
+  </a>
+  <nav class="nav">
+    <a href="#">Home</a>
+    <a href="#about">About Us</a>
+    <a href="#properties">Properties</a>
+    <a href="#">Diaspora Guide</a>
+    <a href="#news">Information Centre</a>
+    <a href="#contact">Contact Us</a>
+    <a class="buy" href="#properties">Buy Property</a>
+  </nav>
+</div></header>
+
+<section class="hero"><div class="in">
+  <span class="yrs">20 years across Kenya, Uganda &amp; Rwanda</span>
+  <h1>Land that moves you</h1>
+  <p>Registered and licensed estate developer in Kenya, focused on large scale
+     peri-urban residential master-planned developments and affordable housing
+     in East Africa.</p>
+  <div class="hbtns">
+    <a class="btn solid" href="#properties">Plots for sale</a>
+    <a class="btn ghost" href="#how">How to buy</a>
+  </div>
+</div></section>
+
+<div class="strip"><div class="in">
+  <b>Individual title deeds</b> will be processed within 90 days of receipt of
+  the full purchase price.
+</div></div>
+
+<section id="how"><div class="in">
+  <p class="eyebrow">How to buy</p>
+  <h2>Buying land with Fusion, step by step</h2>
+  <p class="sub">Choose a plot, book a site visit, pay a deposit and complete
+     in instalments. We handle the title process and keep you updated at every
+     stage. <a href="#">Read more</a></p>
+
+  <div class="why">
+    <div><div class="ic">1</div><h3>Choose your plot</h3>
+      <p>Browse our active projects and pick the size and location that fits
+         your plan.</p></div>
+    <div><div class="ic">2</div><h3>Visit the site</h3>
+      <p>Site visits run on weekdays by prior booking, with transport
+         arranged.</p></div>
+    <div><div class="ic">3</div><h3>Pay a deposit</h3>
+      <p>30% deposit, then the balance in monthly instalments on a plan that
+         suits you.</p></div>
+    <div><div class="ic">4</div><h3>Receive your title</h3>
+      <p>Your individual title deed is processed once payment is
+         complete.</p></div>
+  </div>
+</div></section>
+
+<section class="alt" id="properties"><div class="in">
+  <p class="eyebrow">Our properties</p>
+  <h2>Plots for sale</h2>
+  <p class="sub">Fast-growing, well-connected locations across Kiambu, Kajiado,
+     Nyeri and beyond.</p>
+
+  <div class="props">
+
+    <!-- ==============================================================
+         THE ONE THAT GOES SOMEWHERE. Every other card here is scenery;
+         this one opens the listing page with the Geocode panel on it,
+         carrying the API key through so the widget works on arrival.
+         ============================================================== -->
+    <a class="prop live" href="/demo?site=fusion&k={{KEY}}">
+      <div class="ph"><span class="pill">Available</span></div>
+      <div class="tagd">688 plots mapped &middot; tap any plot for analysis</div>
+      <div class="bd">
+        <h3>Oak Grove City &ndash; Juja</h3>
+        <p class="loc">Juja, Kiambu County</p>
+        <p class="desc">This is for those who want a little more. Oak Grove
+           City is a planned community with space to build.</p>
+        <div class="row"><span class="sz">1/8 | 1/4 Acre</span>
+          <span class="pr">From Ksh 3,300,000</span></div>
+      </div>
+    </a>
+
+    <a class="prop" href="#properties">
+      <div class="ph b"><span class="pill">Available</span></div>
+      <div class="bd">
+        <h3>Greenvale Estate &ndash; Naromoru</h3>
+        <p class="loc">Naromoru, Nyeri County</p>
+        <p class="desc">Greenvale is calm, green, and beautifully located near
+           Mt. Kenya. A great option if you're after space and nature.</p>
+        <div class="row"><span class="sz">1/8 | 1/4 | 1/2 | 1 Acre</span>
+          <span class="pr">From Ksh 450,000</span></div>
+      </div>
+    </a>
+
+    <a class="prop" href="#properties">
+      <div class="ph c"><span class="pill">Available</span></div>
+      <div class="bd">
+        <h3>Oakmont Gardens &ndash; Kitengela</h3>
+        <p class="loc">Kajiado East, off Kitengela&ndash;Namanga Road</p>
+        <p class="desc">Oakmont Gardens plots for sale in Kitengela by Fusion
+           Estates, in the serene Kajiado East area.</p>
+        <div class="row"><span class="sz">1/8 Acre</span>
+          <span class="pr">From Ksh 1,500,000</span></div>
+      </div>
+    </a>
+
+    <a class="prop" href="#properties">
+      <div class="ph d"><span class="pill out">Sold out</span></div>
+      <div class="bd">
+        <h3>Thika Royal Palms</h3>
+        <p class="loc">Murang'a County</p>
+        <p class="desc">Sold out. A gated residential scheme within easy reach
+           of Thika town.</p>
+        <div class="row"><span class="sz">1/8 Acre</span>
+          <span class="pr">From Ksh 2.65M</span></div>
+      </div>
+    </a>
+
+    <a class="prop" href="#properties">
+      <div class="ph d"><span class="pill out">Sold out</span></div>
+      <div class="bd">
+        <h3>Galaxy Gardens &ndash; Kiambu</h3>
+        <p class="loc">Ruiru, Kiambu County</p>
+        <p class="desc">A large-scale master planned 450 plots in a gated mixed
+           use housing estate, just 20 km from Nairobi.</p>
+        <div class="row"><span class="sz">450 plots</span>
+          <span class="pr">Sold out</span></div>
+      </div>
+    </a>
+
+    <a class="prop" href="#properties">
+      <div class="ph d"><span class="pill out">Sold out</span></div>
+      <div class="bd">
+        <h3>Zahara Gardens &ndash; Kikuyu</h3>
+        <p class="loc">Kikuyu, Kiambu County</p>
+        <p class="desc">Sold out. 35 to 40 minutes from the CBD.</p>
+        <div class="row"><span class="sz">1/8 Acre</span>
+          <span class="pr">From Ksh 950,000</span></div>
+      </div>
+    </a>
+
+  </div>
+</div></section>
+
+<section id="about"><div class="in">
+  <div class="about">
+    <div>
+      <p class="eyebrow">About us</p>
+      <h2>A subsidiary of Fusion Capital Limited</h2>
+      <p>Fusion Estates is a registered real estate company in Kenya and a
+         proud subsidiary of Fusion Capital Limited, a leading private equity
+         and real estate firm with over 19 years of experience across Kenya,
+         Uganda and Rwanda.</p>
+      <p><a class="btn solid" href="#" style="margin-top:8px">Learn more</a></p>
+    </div>
+    <div class="stats">
+      <div class="stat"><b>19+</b><span>Years of experience</span></div>
+      <div class="stat"><b>$200M+</b><span>Portfolio under management</span></div>
+      <div class="stat"><b>3</b><span>Countries across East Africa</span></div>
+      <div class="stat"><b>90 days</b><span>To individual title</span></div>
+    </div>
+  </div>
+</div></section>
+
+<section class="alt"><div class="in">
+  <p class="eyebrow">Why choose Fusion Estates</p>
+  <h2>Four things we do not compromise on</h2>
+  <div class="why">
+    <div><div class="ic">&#9678;</div><h3>Prime locations</h3>
+      <p>We sell land in fast-growing, well-connected areas with real
+         potential, from Kitengela, Naromoru to Kikuyu, Juja and beyond.</p></div>
+    <div><div class="ic">&#9635;</div><h3>Full transparency</h3>
+      <p>What you see is what you get. No hidden fees, no shortcuts, just
+         honest processes and open communication.</p></div>
+    <div><div class="ic">&#10003;</div><h3>Clean title guarantee</h3>
+      <p>No stress, no chasing documents. Every plot comes with a verified,
+         ready title, because peace of mind matters.</p></div>
+    <div><div class="ic">&#8646;</div><h3>Flexible payment plans</h3>
+      <p>Own land without breaking the bank. Our easy, tailored payment
+         options make investing accessible to everyone.</p></div>
+  </div>
+</div></section>
+
+<section><div class="in">
+  <p class="eyebrow">Testimonials</p>
+  <h2>What our clients say</h2>
+  <div class="tst">
+    <div><p>"As a client from Alpha Meadows, Fusion Estates' smooth process
+      brought me back to Zahara Gardens. I'm grateful for the opportunity to
+      explore new investments and have even brought friends along."</p>
+      <b>Paul Odhiambo Ogutu</b><i>Alpha Meadows &middot; Zahara Gardens</i></div>
+    <div><p>"Zahara Gardens, just 35&ndash;40 minutes from CBD, offers the
+      flexibility perfect for millennials and Gen Z. It's ideal for both
+      residential living and a solid retirement plan."</p>
+      <b>Lisa Nyutu</b><i>Zahara Gardens</i></div>
+    <div><p>"My experience with Fusion Estates has been truly good. They are a
+      legitimate and trustworthy company and investing in land is a decision
+      you can never go wrong with. I'm eager to be involved in their future
+      projects."</p>
+      <b>Chrispus Mwavita</b><i>Client</i></div>
+    <div><p>"I'm so happy to be an investor with Fusion Estates. I received my
+      title deed on time, I enjoyed excellent customer care, and I truly felt
+      valued. I'd choose them over and over again."</p>
+      <b>Eric Warui</b><i>Client</i></div>
+  </div>
+</div></section>
+
+<section class="alt" id="news"><div class="in">
+  <p class="eyebrow">Information centre</p>
+  <h2>News &amp; guides</h2>
+  <div class="news">
+    <article>
+      <p class="dt">1 October 2025</p>
+      <h3>Kenya's Real Estate Forecast 2026: What Land Buyers Need to Know</h3>
+      <p>As Kenya moves into 2026, land is now more than just a piece of earth;
+         it's become the new "gold".</p>
+      <a href="#">Discover &rarr;</a>
+    </article>
+    <article>
+      <p class="dt">1 October 2024</p>
+      <h3>How to Know a Genuine Title Deed in Kenya?</h3>
+      <p>When you're thinking about buying land in Kenya, one of the most
+         essential due diligence steps is to ask for the title.</p>
+      <a href="#">Discover &rarr;</a>
+    </article>
+    <article>
+      <p class="dt">Guide</p>
+      <h3>A Step-by-Step Guide to Buying Land in Kenya Safely</h3>
+      <p>What to check, in what order, and the documents to insist on before
+         any money changes hands.</p>
+      <a href="#">Discover &rarr;</a>
+    </article>
+  </div>
+</div></section>
+
+<footer class="foot" id="contact"><div class="in">
+  <div class="cols">
+    <div>
+      <h4>Fusion Estates</h4>
+      <p>Registered and licensed Estate developer in Kenya that primarily
+         focuses on large scale peri-urban residential master-planned
+         developments and affordable housing in East Africa.</p>
+      <p><a href="#">Facebook</a> &middot; <a href="#">X</a> &middot;
+         <a href="#">Instagram</a> &middot; <a href="#">TikTok</a></p>
+    </div>
+    <div>
+      <h4>Plots for sale</h4>
+      <ul>
+        <li><a href="/demo?site=fusion&k={{KEY}}">Oak Grove City &ndash; Juja</a></li>
+        <li><a href="#properties">Greenvale Estate &ndash; Naromoru</a></li>
+        <li><a href="#properties">Oakmont Gardens Kitengela</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Quick links</h4>
+      <ul>
+        <li><a href="#">Home</a></li><li><a href="#about">About Us</a></li>
+        <li><a href="#properties">Properties</a></li>
+        <li><a href="#">Diaspora Guide</a></li>
+        <li><a href="#contact">Contact</a></li><li><a href="#">CSR</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Get updates!</h4>
+      <p style="font-size:13.5px">Sign up for our latest news &amp; articles.
+         We won't give you spam mails.</p>
+      <div class="nl">
+        <input type="email" placeholder="Your email address" aria-label="Email">
+        <button type="button">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="cols" style="margin-top:30px">
+    <div><h4>Kenya</h4>
+      <p>4th Ngong Avenue Towers, 20th Floor<br>
+         +254 794 777 333<br>+254 723 97 97 97<br>
+         Info@fusionestatesafrica.com</p></div>
+    <div style="grid-column:span 2"><h4>United Kingdom</h4>
+      <p>Kennedy House, 31 Stamford St, Ground Floor,<br>
+         Altrincham, Greater Manchester WA14 1ES</p></div>
+  </div>
+
+  <p class="tiny">
+    PREVIEW ONLY. This page was prepared by Geocode Spatial Solutions Ltd as a
+    proposal for Fusion Estates Africa and is not operated by Fusion Estates.
+    Company description, project names, prices, testimonials and contact
+    details are reproduced from Fusion Estates' own published website so that
+    the proposal is recognisable. Nothing on this page is an offer, and no
+    plot is being sold here.
+  </p>
+</div></footer>
+
+</body>
+</html>

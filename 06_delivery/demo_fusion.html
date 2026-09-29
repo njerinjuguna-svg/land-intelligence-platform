@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>PREVIEW for Fusion Estates - Oak Grove City, Juja</title>
+<!--
+  ==========================================================================
+  PROPOSAL PREVIEW FOR FUSION ESTATES AFRICA
+  Land Intelligence Platform - Geocode Spatial Solutions Ltd
+
+  WHAT THIS IS
+    A mock-up of Fusion Estates' own Oak Grove City listing with the Geocode
+    analysis panel dropped into it, built to show Fusion what the panel would
+    look like on their page. Their copy, their prices, their plots.
+
+  WHY THE BANNER AT THE TOP DOES NOT COME OFF
+    This page carries another company's name, wording and prices, and it is
+    served over a public tunnel URL. A buyer who found that link without the
+    banner would reasonably believe they were on Fusion's website. That would
+    be a copy of a real company's listing standing on the open internet, and
+    we are not doing that - not as a shortcut, not for a demo.
+
+    It is also better salesmanship. A page that announces itself as a
+    proposal reads as a proposal. An unmarked clone of somebody's website
+    reads as a liberty taken with their brand, which is a strange thing to
+    hand a company you are asking to trust you.
+
+    noindex is belt and braces. The banner is the actual control.
+
+  WHAT IS REAL HERE AND WHAT IS NOT
+    REAL: the plot boundaries, the analysis, every figure in the panel. Those
+          are Fusion's own 688 plots, recovered from the Oak Grove CAD file
+          and enriched from sourced datasets.
+    THEIRS: the headline, the description, the amenity list, the prices, the
+          payment terms, the contact details. Taken from their live page so
+          they recognise it. Nothing here is invented about their scheme.
+
+  Served at:  /demo?site=fusion&k=<key>
+  ==========================================================================
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Jost:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#1c2620; --muted:#66756c; --line:#e2e7e3;
+    --brand:#0f4c2a; --gold:#c0932e; --paper:#fff; --wash:#f5f7f5;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--wash);color:var(--ink);
+       font:16px/1.65 Jost,"Segoe UI",Helvetica,Arial,sans-serif;
+       -webkit-font-smoothing:antialiased}
+  a{color:var(--brand)}
+  .in{max-width:1060px;margin:0 auto;padding:0 24px}
+
+  /* ---- the banner that does not come off ---- */
+  .preview{background:#1c2620;color:#fff;font-size:13.5px;line-height:1.5}
+  .preview .in{padding:11px 24px;display:flex;gap:14px;align-items:center;
+               flex-wrap:wrap}
+  .preview b{color:#ffd97a;font-weight:600;letter-spacing:.04em;
+             text-transform:uppercase;font-size:11.5px;
+             border:1px solid rgba(255,217,122,.45);border-radius:4px;
+             padding:3px 8px;white-space:nowrap}
+  .preview span{color:#c9d4cd}
+
+  /* ---- masthead ---- */
+  .top{background:var(--paper);border-bottom:1px solid var(--line)}
+  .top .in{display:flex;align-items:center;gap:12px;padding-top:15px;
+           padding-bottom:15px;flex-wrap:wrap}
+  .mark{display:flex;align-items:center;gap:11px;text-decoration:none;
+        color:var(--ink)}
+  .mark b{display:block;font-size:19px;font-weight:700;letter-spacing:-.01em}
+  .mark i{display:block;font-style:normal;font-size:10.5px;color:var(--muted);
+          letter-spacing:.18em;text-transform:uppercase;margin-top:1px}
+  .nav{margin-left:auto;display:flex;gap:20px;font-size:14px;flex-wrap:wrap}
+  .nav a{color:var(--muted);text-decoration:none}
+  .nav a:hover{color:var(--brand)}
+
+  /* ---- hero ---- */
+  .hero{background:var(--brand);color:#fff}
+  .hero .in{padding:44px 24px 40px}
+  .hero .crumb{font-size:12px;letter-spacing:.13em;text-transform:uppercase;
+               color:#9dc4ac;margin:0 0 12px}
+  .hero h1{margin:0 0 8px;font-size:42px;line-height:1.08;font-weight:700;
+           letter-spacing:-.02em}
+  .hero .tag{margin:0;color:#cfe3d6;font-size:17px}
+  .hero .from{margin-top:26px;display:flex;align-items:flex-end;gap:26px;
+              flex-wrap:wrap}
+  .hero .from .lab{font-size:11.5px;letter-spacing:.14em;
+                   text-transform:uppercase;color:#9dc4ac;display:block}
+  .hero .from .val{font-size:33px;font-weight:700;color:var(--gold);
+                   line-height:1.1}
+  .btns{margin-left:auto;display:flex;gap:10px;flex-wrap:wrap}
+  .btn{padding:12px 22px;border-radius:6px;font-size:14.5px;font-weight:500;
+       text-decoration:none;border:1px solid #fff}
+  .btn.solid{background:var(--gold);border-color:var(--gold);color:#241c05}
+  .btn.ghost{color:#fff}
+
+  /* ---- body ---- */
+  .wrap{padding:36px 0 56px}
+  .card{background:var(--paper);border:1px solid var(--line);border-radius:10px;
+        padding:28px;margin-bottom:22px}
+  h2{margin:0 0 14px;font-size:23px;letter-spacing:-.01em}
+  h3{margin:22px 0 8px;font-size:15px;letter-spacing:.1em;
+     text-transform:uppercase;color:var(--muted)}
+  p{margin:0 0 14px}
+  .lead{font-size:17px}
+  ul{margin:0 0 14px;padding-left:20px}
+  li{margin-bottom:7px}
+  table{border-collapse:collapse;width:100%;margin:6px 0 4px}
+  th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);
+        font-size:15px}
+  th{font-weight:600;width:46%}
+  td.price{font-weight:700;color:var(--brand)}
+  td.sold{color:#a33;font-weight:600;letter-spacing:.05em}
+  .note{font-size:13.5px;color:var(--muted)}
+  .foot{background:#1c2620;color:#b9c6bf;font-size:14px}
+  .foot .in{padding:30px 24px}
+  .foot a{color:#dbe6df}
+  .foot .cols{display:grid;gap:24px;
+              grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
+  .foot h4{margin:0 0 8px;color:#fff;font-size:14px;letter-spacing:.08em;
+           text-transform:uppercase}
+  .tiny{font-size:12px;color:#8c9b93;margin-top:22px;
+        border-top:1px solid #2c3a33;padding-top:16px}
+</style>
+</head>
+<body>
+
+<!-- ====================================================================
+     This banner is a control, not decoration. See the comment in <head>.
+     ==================================================================== -->
+<div class="preview"><div class="in">
+  <b>Preview</b>
+  <span>A proposal prepared by <strong style="color:#fff">Geocode Spatial
+  Solutions</strong> for Fusion Estates Africa. Not a live Fusion Estates
+  listing. The map and the plot analysis below are real: 688 plots recovered
+  from your own Oak Grove drawing.</span>
+</div></div>
+
+<header class="top"><div class="in">
+  <a class="mark" href="/demo?site=fusion_home&k={{KEY}}">
+    <svg width="36" height="36" viewBox="0 0 40 40" aria-hidden="true">
+      <circle cx="20" cy="20" r="19" fill="#0f4c2a"/>
+      <path d="M20 30c-5-4-8-7.5-8-11.5A8 8 0 0 1 28 18.5C28 22.5 25 26 20 30z"
+            fill="#c0932e"/>
+      <circle cx="20" cy="18.5" r="3.1" fill="#0f4c2a"/>
+    </svg>
+    <span><b>Fusion Estates</b><i>Your land ownership partner</i></span>
+  </a>
+  <nav class="nav">
+    <a href="/demo?site=fusion_home&k={{KEY}}">Home</a>
+    <a href="/demo?site=fusion_home&k={{KEY}}#about">About Us</a>
+    <a href="/demo?site=fusion_home&k={{KEY}}#properties">Properties</a>
+    <a href="#">Diaspora Guide</a>
+    <a href="/demo?site=fusion_home&k={{KEY}}#news">Information Centre</a>
+    <a href="#contact">Contact Us</a>
+  </nav>
+</div></header>
+
+<section class="hero"><div class="in">
+  <p class="crumb"><a href="/demo?site=fusion_home&k={{KEY}}"
+     style="color:#9dc4ac;text-decoration:none">Properties</a>
+     / Plots For Sale / Kiambu County</p>
+  <h1>Oak Grove City &ndash; Juja</h1>
+  <p class="tag">Where Luxury Living Meets Investment Potential</p>
+  <div class="from">
+    <div>
+      <span class="lab">Plots from</span>
+      <span class="val">KES 3,300,000</span>
+    </div>
+    <div class="btns">
+      <a class="btn solid" href="#plots">View available plots</a>
+      <a class="btn ghost" href="tel:+254794777333">+254 794 777 333</a>
+    </div>
+  </div>
+</div></section>
+
+<div class="wrap"><div class="in">
+
+  <div class="card">
+    <h2>About Oak Grove City</h2>
+    <p class="lead">Welcome to Oak Grove City, Juja, a beautifully planned,
+      modern gated community just 5 km from Juja town. Once a coffee
+      plantation, this scenic land now holds the future of family living,
+      complete with luxurious amenities and lush green space.</p>
+
+    <h3>Location</h3>
+    <ul>
+      <li>Direct access to tarmac roads</li>
+      <li>Proximity to schools, healthcare and shopping</li>
+      <li>Only 5 km from Juja Town and 35 minutes to Nairobi CBD</li>
+    </ul>
+
+    <h3>Amenities</h3>
+    <ul>
+      <li>Secure gated community with clubhouse, school, pool and gym</li>
+      <li>Paved roads, jogging tracks and landscaped spaces</li>
+      <li>Utilities installed: power, water, drainage and solar lighting</li>
+      <li>Commercial complex and ridge views</li>
+      <li>Spacious plots with available designs</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>Pricing</h2>
+    <p class="note">Early bird offer</p>
+    <table>
+      <tr><th>1/8 Acre</th><td class="price">KES 3,300,000</td></tr>
+      <tr><th>1/4 Acre</th><td class="price">KES 6,500,000</td></tr>
+      <tr><th>1/2 Acre</th><td class="price">KES 13,000,000</td></tr>
+      <tr><th>Commercial plots</th><td class="sold">SOLD OUT</td></tr>
+    </table>
+    <h3>Payment terms</h3>
+    <p>30% deposit and balance in monthly instalments.</p>
+    <h3>Title deeds</h3>
+    <p>Processed within 30 working days after completion of payment. The
+      purchase price excludes title processing fees.</p>
+  </div>
+
+  <!-- ==================================================================
+       THE ONLY NEW THING ON THIS PAGE.
+
+       Everything above is Fusion's own listing. Everything below this line
+       is the panel being proposed: their 688 plots, recovered from their
+       own Oak Grove drawing, each one enriched and rated, on a live map a
+       buyer can move and tap.
+
+       Two lines of code on their side. That is the entire integration.
+       ================================================================== -->
+  <div class="card" id="plots">
+    <h2>Explore the plots</h2>
+    <p class="note">Find a plot on the map, then tap it to see what the land
+      is: soil, rainfall, slope, flood exposure, road access and how far the
+      nearest school, clinic, market and matatu stage really are.</p>
+
+    <div id="geocode-scheme" data-scheme="OAK GROVE"></div>
+  </div>
+
+  <div class="card">
+    <h2>Book a site visit</h2>
+    <p>Site visits run on weekdays by prior booking.</p>
+    <p class="note">
+      +254 794 777 333 &nbsp;&middot;&nbsp; +254 723 97 97 97
+      &nbsp;&middot;&nbsp; Info@fusionestatesafrica.com
+    </p>
+  </div>
+
+</div></div>
+
+<footer class="foot"><div class="in">
+  <div class="cols">
+    <div>
+      <h4>Fusion Estates</h4>
+      <p>Registered and licensed estate developer in Kenya.</p>
+    </div>
+    <div>
+      <h4>Kenya</h4>
+      <p>4th Ngong Avenue Towers, 20th Floor<br>
+         +254 794 777 333<br>+254 723 97 97 97</p>
+    </div>
+    <div>
+      <h4>United Kingdom</h4>
+      <p>Kennedy House, 31 Stamford St, Ground Floor,<br>
+         Altrincham, Greater Manchester WA14 1ES</p>
+    </div>
+  </div>
+  <p class="tiny">
+    PREVIEW ONLY. This page was prepared by Geocode Spatial Solutions Ltd as a
+    proposal for Fusion Estates Africa and is not operated by Fusion Estates.
+    Listing copy, prices and contact details are reproduced from Fusion
+    Estates' own published listing so that the proposal is recognisable.
+    Nothing on this page is an offer.
+  </p>
+</div></footer>
+
+<script src="/v1.js" data-key="{{KEY}}"></script>
+</body>
+</html>

@@ -195,10 +195,131 @@ def compare(name, live_rows, reb_rows, nkey):
     return len(ship_missing) + len(ship_differ)
 
 
+def row_counts(engine, label):
+    """Exact count(*) for every table. Slow on purpose.
+
+    reltuples would be instant and would report zero on a freshly restored
+    database, because nothing has been ANALYZEd yet - an estimate that says
+    'empty' about a full table is worse than no check at all. This is a drill
+    that runs occasionally; correctness beats speed.
+    """
+    with engine.connect() as conn:
+        tables = conn.execute(text("""
+            SELECT table_schema, table_name
+              FROM information_schema.tables
+             WHERE table_type = 'BASE TABLE'
+               AND table_schema NOT IN :sys AND table_schema NOT LIKE 'pg_%%'
+             ORDER BY 1, 2"""), {"sys": SYSTEM_SCHEMAS}).all()
+        out = {}
+        for sch, tbl in tables:
+            try:
+                n = conn.execute(text(
+                    f'SELECT count(*) FROM "{sch}"."{tbl}"')).scalar()
+            except Exception:                                 # noqa: BLE001
+                n = None
+            out[(sch, tbl)] = n
+    print(f"   counted {len(out)} table(s) in {label}")
+    return out
+
+
+def compare_rows(live_counts, reb_counts, dump_age_hours=None):
+    """Did the restore work, and what would restoring it cost you today?
+
+    THE FIRST VERSION OF THIS WAS WRONG, and wrong in a way worth keeping
+    written down. It failed the drill because clients.api_keys held 3 rows
+    live and 1 in the restore - and that was CORRECT: the dump was six days
+    old and two keys had been minted since. A backup containing fewer rows
+    than a database that has grown is a backup behaving exactly as intended.
+
+    Treating any shortfall as failure means the check can only ever pass for
+    a dump taken this instant, which is not a thing anyone has. Worse, it
+    cries wolf, and a drill that cries wolf is a drill that stops being run.
+
+    So the two questions are separated, because they are different questions:
+
+      DID THE RESTORE WORK?     a table absent, or present with zero rows
+                                where live has many. Nothing legitimate
+                                produces that. This fails the drill.
+
+      WHAT IS THE RECOVERY POINT? tables with fewer rows than live, all
+                                non-zero. This is drift since the dump, it is
+                                expected, it grows with the dump's age - and
+                                it is the genuinely useful output, because it
+                                says what you would lose by restoring today.
+    """
+    print(f"\n{'-' * 74}\nROW COUNTS\n{'-' * 74}")
+    missing, empty, drift, over, empty_live = [], [], [], [], 0
+
+    for key, live_n in sorted(live_counts.items()):
+        name = ".".join(key)
+        if key not in reb_counts:
+            missing.append((name, live_n))
+            continue
+        reb_n = reb_counts[key]
+        if live_n is None or reb_n is None:
+            continue
+        if live_n == 0:
+            empty_live += 1
+            continue
+        if reb_n == 0:
+            empty.append((name, live_n))
+        elif reb_n < live_n:
+            drift.append((name, live_n, reb_n))
+        elif reb_n > live_n:
+            over.append((name, live_n, reb_n))
+
+    bad = 0
+    if missing:
+        bad += len(missing)
+        print(f"\n   *** {len(missing)} TABLE(S) ABSENT FROM THE RESTORE:")
+        for name, n in missing:
+            print(f"         {name}  ({n:,} rows live)")
+    if empty:
+        bad += len(empty)
+        print(f"\n   *** {len(empty)} TABLE(S) RESTORED COMPLETELY EMPTY:")
+        for name, n in empty:
+            print(f"         {name}  live {n:,}  restored 0")
+        print("\n   Nothing legitimate produces an empty table where live has")
+        print("   rows. This is the failure the drill exists to find.")
+
+    if drift:
+        age = (f" (dump is {dump_age_hours:.0f} hours old)"
+               if dump_age_hours else "")
+        print(f"\n   RECOVERY POINT{age} - restoring this dump today would "
+              f"lose:")
+        for name, ln, rn in drift:
+            print(f"         {name:<44} {ln - rn:,} row(s)  "
+                  f"({rn:,} of {ln:,})")
+        print("\n   This is drift since the dump was taken, not damage. It")
+        print("   grows with the dump's age, and it is the number to weigh")
+        print("   when deciding how often to run a backup.")
+
+    if over:
+        print(f"\n   {len(over)} table(s) have MORE rows in the restore than "
+              f"live.\n   The live database LOST rows since the dump. Worth "
+              f"understanding\n   before dismissing:")
+        for name, ln, rn in over[:10]:
+            print(f"         {name}  live {ln:,}  restored {rn:,}")
+
+    if not bad:
+        n_ok = sum(1 for k, v in live_counts.items() if v)
+        intact = n_ok - len(drift)
+        print(f"\n   {intact} of {n_ok} non-empty table(s) restored complete; "
+              f"{len(drift)} carry drift.")
+        if empty_live:
+            print(f"   ({empty_live} table(s) are empty in live too - not "
+                  f"checked)")
+    return bad
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", default="land_intelligence_kenya")
     ap.add_argument("--rebuilt", required=True)
+    ap.add_argument("--rows", action="store_true",
+                    help="also compare row counts (for a restore drill)")
+    ap.add_argument("--dump-age-hours", type=float, default=None,
+                    help="age of the dump, so drift can be read in context")
     a = ap.parse_args()
 
     if a.live == a.rebuilt:
@@ -222,7 +343,34 @@ def main():
                             fetch(live, q, f"live '{a.live}'"),
                             fetch(reb, q, f"rebuilt '{a.rebuilt}'"), nkey)
 
+    row_problems = 0
+    if a.rows:
+        print(f"\n{'-' * 74}\ncounting rows (exact, so this takes a moment)"
+              f"\n{'-' * 74}")
+        row_problems = compare_rows(row_counts(live, a.live),
+                                    row_counts(reb, a.rebuilt),
+                                    a.dump_age_hours)
+
     print("\n" + "=" * 74)
+    if a.rows:
+        if row_problems:
+            print(f"RESTORE BROKEN: {row_problems} table(s) absent or empty.")
+            print()
+            print("This backup would not have brought the workbench back.")
+            print("Do not treat it as a backup until this is understood.")
+        elif not blockers:
+            print("RESTORE VERIFIED.")
+            print()
+            print("Schema identical. No table absent, none restored empty.")
+            print("A backup has now actually been restored into a working")
+            print("database and compared against the original, which is the")
+            print("difference between a backup and a belief.")
+            print()
+            print("Any drift listed above is the RECOVERY POINT, not damage:")
+            print("what restoring this particular dump would cost you today.")
+        print("=" * 74)
+        sys.exit(1 if (row_problems or blockers) else 0)
+
     if blockers:
         print(f"{blockers} DEPLOY BLOCKER(S) ON SHIPPED SCHEMAS.")
         print()

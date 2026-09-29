@@ -40,6 +40,7 @@ RUN IT
 
 import os
 import re
+import math
 import sys
 import json
 import time
@@ -153,6 +154,25 @@ else:
           f"will show a placeholder where the pictures go. Add "
           f"GOOGLE_MAPS_KEY=... to that file and RESTART.", file=sys.stderr)
 
+# Reported separately, because "the interactive map is missing" is otherwise
+# indistinguishable from "the pictures are missing" and the two have
+# different causes and different fixes.
+_ek = (os.getenv("GOOGLE_MAPS_EMBED_KEY") or "").strip()
+if _ek and _ek == _gk:
+    print("[config] Embed key: SAME AS THE SERVER KEY - the interactive map "
+          "is disabled. That URL is public, so this would publish the key "
+          "that bills Static Maps. Make a second key restricted to the Maps "
+          "Embed API.", file=sys.stderr)
+elif _ek:
+    print(f"[config] Embed key: set ({_ek[:6]}...{_ek[-4:]}) - the movable "
+          f"map on each plot is enabled", file=sys.stderr)
+else:
+    print(f"[config] Embed key: not set - the movable map on each plot is "
+          f"using OpenStreetMap, which needs no key. It shows roads and "
+          f"place names rather than imagery. For a satellite one, add a "
+          f"SECOND key restricted to the Maps Embed API as "
+          f"GOOGLE_MAPS_EMBED_KEY=... in {_ENV_FILE}.", file=sys.stderr)
+
 app = FastAPI(title="Geocode LandIQ embed API", version=API_VERSION)
 
 # ---------------------------------------------------------------------------
@@ -202,9 +222,25 @@ def loader():
     """
     if not LOADER.exists():
         raise HTTPException(500, "loader missing")
-    return Response(LOADER.read_text(encoding="utf-8"),
-                    media_type="application/javascript",
-                    headers={"Cache-Control": "public, max-age=300"})
+    body = LOADER.read_text(encoding="utf-8")
+
+    # NO-CACHE, AND THE REASON IS NOT PARANOIA.
+    #
+    # This was max-age=300. The server renders the HTML; this file supplies
+    # the behaviour that HTML depends on, and the two ship together. For five
+    # minutes after any deploy a browser would pair NEW markup with an OLD
+    # loader, and the failure that produces is the worst kind: everything
+    # renders, nothing is missing, and the controls simply do nothing. It
+    # cost a round trip to find exactly that - zoom buttons drawn by the new
+    # server, driven by a loader from before they existed.
+    #
+    # no-cache does not mean "download every time". It means "ask every
+    # time", and the ETag makes the answer 304 Not Modified with no body on
+    # every load but the first after a change. One conditional request for a
+    # 12 KB file is a price worth paying for never being out of step.
+    etag = '"' + hashlib.sha256(body.encode("utf-8")).hexdigest()[:16] + '"'
+    return Response(body, media_type="application/javascript",
+                    headers={"Cache-Control": "no-cache", "ETag": etag})
 
 
 # ---------------------------------------------------------------------------
@@ -457,15 +493,13 @@ def plot_embed(ref: str, request: Request, x_api_key: str = Header(None)):
     if rep is None:
         log_call(auth, request, 404, ms)
         raise HTTPException(404, f"No plot '{ref}' for this account.")
-    with engine.connect() as conn:
-        b = conn.execute(text("""
-            SELECT report_footer FROM clients.branding
-             WHERE company_id = :c LIMIT 1"""),
-            {"c": auth["company_id"]}).one_or_none()
+    # One query for all of it now, validated, instead of report_footer alone.
+    b = fetch_branding(auth["company_id"])
     log_call(auth, request, 200, ms)
-    return HTMLResponse(listing_html(rep, b[0] if b and b[0] else "",
+    return HTMLResponse(listing_html(rep, b["footer"],
                                      api_key=x_api_key,
-                                     company_id=auth["company_id"]))
+                                     company_id=auth["company_id"],
+                                     branding=b))
 
 
 TONE_COLOR = {"yes": "#0ca30c", "careful": "#fab219", "no": "#d03b3b",
@@ -597,6 +631,34 @@ def scheme_rows(company_id, project):
 #   that must not be made. On a card that means "Not rated" and nothing else.
 # ===========================================================================
 
+# HOW MANY PLOTS ONE PAGE RENDERS, AND WHY THE NUMBER IS NAMED.
+#
+# It used to be the bare literal 200, written three times, in the index query,
+# the marker query and the ring query. Oak Grove has 688 plots. The widget
+# rendered 200 of them, drew 200 on the map, and printed
+#
+#     "153 of 200 available"
+#
+# to a buyer, which is not a truncated total. It is a WRONG one. The other 488
+# plots did not exist as far as anyone reading that page could tell, and
+# nothing anywhere said a limit had been reached.
+#
+# That is the same failure that put thirteen CAD fragments in this database
+# for weeks: a component that keeps what it can carry and never mentions what
+# it dropped. So the true count is now fetched separately, always, and the
+# page says both numbers whenever they differ.
+# 200 was chosen when the largest real scheme held thirteen plots. Oak Grove
+# holds 688 and a seller whose page silently omits 488 of them has been sold
+# a broken product. A card is a small button, so 688 of them is a page a
+# phone renders without complaint; the cost of being generous here is much
+# lower than the cost of being quietly wrong.
+#
+# The limit does not go away, because an unbounded query behind a public
+# endpoint is how a page takes a minute to load. It moves to where a scheme
+# is genuinely enormous, and the count above makes that case visible instead
+# of silent.
+INDEX_MAX = 1000
+
 INDEX_SQL = text("""
     SELECT p.parcel_ref, p.project_name, p.listing_status, p.price_kes,
            p.area_sqm, s.overall_score,
@@ -608,16 +670,33 @@ INDEX_SQL = text("""
        AND p.listing_status NOT IN ('hidden', 'cancelled')
        AND (:proj = '' OR p.project_name = :proj)
      ORDER BY p.project_name NULLS LAST, p.parcel_ref
-     LIMIT 200""")
+     LIMIT :lim""")
+
+# Deliberately the same WHERE clause as INDEX_SQL and no LIMIT. If the two
+# ever drift apart the page will report a total it is not listing from, which
+# is the defect this pair exists to prevent, so they are kept adjacent.
+INDEX_COUNT_SQL = text("""
+    SELECT count(*) FROM land.parcels p
+     WHERE p.company_id = :cid AND p.status = 'active'
+       AND p.listing_status NOT IN ('hidden', 'cancelled')
+       AND (:proj = '' OR p.project_name = :proj)""")
 
 USE_WORDS = {"residential": "a home", "agricultural": "farming",
              "commercial": "business", "investment": "investment"}
 
 
 def index_rows(company_id, project=""):
+    """-> (cards, total). TOTAL IS NOT len(cards) AND MUST NOT BE TREATED AS IT.
+
+    Returning them as a pair rather than letting the caller measure the list
+    is the point: a caller that wants to print a total has to hold the real
+    one, and cannot reach for len() and print a number that is really the
+    page size.
+    """
+    p = {"cid": company_id, "proj": project or ""}
     with engine.connect() as conn:
-        rows = conn.execute(INDEX_SQL,
-                            {"cid": company_id, "proj": project or ""}).all()
+        total = conn.execute(INDEX_COUNT_SQL, p).scalar() or 0
+        rows = conn.execute(INDEX_SQL, dict(p, lim=INDEX_MAX)).all()
     from report_content import STATUS_WORDS, acres
     out = []
     for ref, proj, state, price, area, score, best in rows:
@@ -634,7 +713,7 @@ def index_rows(company_id, project=""):
                       "Good" if v >= 75 else "Fair" if v >= 55 else "Poor"),
             "use": USE_WORDS.get(best, best) if best else None,
         })
-    return out
+    return out, total
 
 
 # One-character labels, because that is all a Google static map marker will
@@ -663,26 +742,548 @@ def _scheme_points(company_id, project):
                AND listing_status NOT IN ('hidden', 'cancelled')
                AND (:proj = '' OR project_name = :proj)
              ORDER BY project_name NULLS LAST, parcel_ref
-             LIMIT 200"""),
-            {"cid": company_id, "proj": project or ""}).all()
+             LIMIT :lim"""),
+            {"cid": company_id, "proj": project or "",
+             "lim": INDEX_MAX}).all()
     return [(r[0], float(r[1]), float(r[2])) for r in rows]
 
 
-def _scheme_map_bytes(company_id, project):
-    """A satellite map of the whole scheme, numbered.
+# ===========================================================================
+# THE SCHEME MAP - PLOT BOUNDARIES, NUMBERED INSIDE EACH ONE
+#
+# Pins at a centroid answer "roughly where", which is not the question a
+# buyer looking at a subdivision asks. They want to see the SHAPE of plot 3,
+# where it sits against plot 4, and which one is on the corner. That needs
+# the boundaries drawn, and the number inside the boundary rather than on a
+# pin floating above it.
+#
+# Google's Static Maps API can draw paths, but it cannot put text inside one -
+# markers are its only labels, and a marker is a pin. So the satellite base
+# comes from Google and THE OVERLAY IS DRAWN HERE, which also means the
+# styling is ours and there is no URL-length ceiling on how many plots or how
+# detailed their boundaries can be.
+#
+# THE COORDINATES STILL NEVER REACH A BROWSER. The parcel geometry is read,
+# projected to pixels and burned into a JPEG server-side. What leaves this
+# process is a picture - which is exactly what rules A4/B4 permit, and the
+# reason the overlay is composited here rather than handed to a mapping
+# library on the page.
+# ===========================================================================
 
-    No center and no zoom: Google fits the view to the markers, which is
-    exactly right for a scheme whose extent we would otherwise have to
-    compute and would get wrong on the one scheme that straggles.
+def _world_px(lat, lon, zoom, scale):
+    """Web Mercator, the projection Google Static Maps actually uses.
 
-    Like every other picture here, the server fetches it and streams the
-    bytes - the plots' coordinates never reach a browser.
+    At zoom z the world is 256 * 2^z pixels square, multiplied by scale.
+    Getting this wrong puts the boundaries in a field next to the plots, so
+    it is verified against a known point rather than assumed.
+    """
+    n = 256.0 * (2 ** zoom) * scale
+    x = (lon + 180.0) / 360.0 * n
+    siny = math.sin(math.radians(lat))
+    siny = min(max(siny, -0.9999), 0.9999)
+    y = (0.5 - math.log((1 + siny) / (1 - siny)) / (4 * math.pi)) * n
+    return x, y
+
+
+def _fit_zoom(bbox, w, h, scale, pad=0.12):
+    """Largest zoom at which the whole scheme still fits, with a margin.
+
+    Chosen here rather than left to Google, because Google only auto-fits
+    around markers and we are no longer using markers.
+    """
+    (min_lon, min_lat, max_lon, max_lat) = bbox
+    for z in range(21, 0, -1):
+        x1, y1 = _world_px(max_lat, min_lon, z, scale)
+        x2, y2 = _world_px(min_lat, max_lon, z, scale)
+        if (abs(x2 - x1) <= w * scale * (1 - pad)
+                and abs(y2 - y1) <= h * scale * (1 - pad)):
+            return z
+    return 1
+
+
+def _frame_and_zoom(bbox, scale=2, maxdim=640, mindim=200, margin=18):
+    """-> (w, h, zoom). The picture is shaped like the land, not like a video.
+
+    THE MEASUREMENT THAT PRODUCED THIS. Oak Grove is 688 plots and, in
+    Mercator pixels, almost exactly square. Drawn into the old fixed 640x360
+    letterbox the whole scheme only fits at zoom 15, where a 450 m2 plot is
+    about eight pixels across and no number can be drawn inside it. Counting
+    how many plots could carry a legible number:
+
+        640x360   zoom 15     61 of 688   (9%)
+        640x480   zoom 15     61 of 688   (9%)
+        640x560   zoom 16    666 of 688   (97%)
+        640x640   zoom 16    666 of 688   (97%)
+
+    Half the frame was empty sky and it cost a whole zoom level. Nothing
+    about the label drawing changed between those rows. The frame was the
+    entire difference between a map that answers "which plot is which" and
+    one that does not.
+
+    THE ORDER MATTERS, and getting it the other way round is what the first
+    attempt did. Choosing the frame from the scheme's aspect and THEN fitting
+    a zoom into it leaves slack, because zoom levels are integers: the
+    content lands somewhere between filling the frame and filling a quarter
+    of it, and on the first render two thirds of the picture was empty.
+
+    So the zoom is chosen first, as the largest that fits inside the biggest
+    frame Google will serve, and the frame is then cut to the content at that
+    zoom. The scheme fills the picture by construction rather than by luck.
+    """
+    # The margin is counted ONCE. The first version tested the content
+    # against maxdim*(1-pad) and then also grew the frame by (1+pad), paying
+    # for the same gutter twice: Oak Grove came back at zoom 16 in a 335 px
+    # frame when it fits inside 640 at zoom 17, which is a factor of two of
+    # detail thrown away by an arithmetic slip.
+    for zoom in range(21, 0, -1):
+        x1, y1 = _world_px(bbox[3], bbox[0], zoom, scale)
+        x2, y2 = _world_px(bbox[1], bbox[2], zoom, scale)
+        dx, dy = abs(x2 - x1) / scale, abs(y2 - y1) / scale
+        if dx + margin <= maxdim and dy + margin <= maxdim:
+            w = int(max(mindim, min(maxdim, math.ceil(dx) + margin)))
+            h = int(max(mindim, min(maxdim, math.ceil(dy) + margin)))
+            return w, h, zoom
+    return 640, 360, 1
+
+
+def _scheme_rings(company_id, project):
+    """[(ref, [ring, ...], label_lon, label_lat)] - server-side only.
+
+    ST_PointOnSurface, not ST_Centroid: the centroid of an L-shaped or
+    crescent plot falls outside it, and a number printed outside its own
+    boundary is worse than no number.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT parcel_ref,
+                   ST_AsGeoJSON(geom),
+                   ST_X(ST_PointOnSurface(geom)),
+                   ST_Y(ST_PointOnSurface(geom))
+              FROM land.parcels
+             WHERE company_id = :cid AND status = 'active'
+               AND listing_status NOT IN ('hidden', 'cancelled')
+               AND (:proj = '' OR project_name = :proj)
+             ORDER BY project_name NULLS LAST, parcel_ref
+             LIMIT :lim"""),
+            {"cid": company_id, "proj": project or "",
+             "lim": INDEX_MAX}).all()
+
+    out = []
+    for ref, gj, lx, ly in rows:
+        try:
+            g = json.loads(gj)
+        except (TypeError, ValueError):
+            continue
+        polys = ([g["coordinates"]] if g.get("type") == "Polygon"
+                 else g.get("coordinates", []))
+        rings = [poly[0] for poly in polys if poly and poly[0]]
+        if rings:
+            out.append((ref, rings, float(lx), float(ly)))
+    return out
+
+
+def _latlon_from_world(x, y, zoom, scale):
+    """The inverse of _world_px. Pixel on the scheme map back to a coordinate.
+
+    This exists so a buyer can tap a plot on the picture. The tap arrives as
+    a position in the image, and the only way to turn that into a plot is to
+    turn it back into a point on the ground and ask the database which parcel
+    contains it. Doing that here rather than in the browser is what keeps the
+    boundaries off the client: the page never learns where anything is, it
+    just reports where the finger landed.
+    """
+    n = 256.0 * (2 ** zoom) * scale
+    lon = x / n * 360.0 - 180.0
+    lat_rad = (0.5 - y / n) * 4.0 * math.pi
+    lat = math.degrees(math.asin(math.tanh(lat_rad / 2.0)))
+    return lat, lon
+
+
+_FRAME_CACHE = {}
+_FRAME_CACHE_MAX = 64
+
+
+def _scheme_frame_geometry(company_id, project, w=640, h=None, scale=2):
+    """The frame only: (w, h, zoom, clat, clon). Cached.
+
+    A tap needs the frame and nothing else, and working it out the long way
+    means reading 688 polygons out of the database to look at their extent.
+    That is a fine price to pay once when drawing a picture and an absurd one
+    to pay every time a buyer's finger lands on it.
+
+    Keyed on _updated_tag, which already changes whenever a parcel in the
+    scheme changes, so the cache cannot serve a frame from before a plot
+    moved. That would silently resolve taps against a stale picture, which is
+    exactly the drift _scheme_frame exists to prevent.
+    """
+    key = (company_id, project or "", w, h, scale,
+           _updated_tag(company_id, project=project))
+    if key in _FRAME_CACHE:
+        return _FRAME_CACHE[key]
+    frame = _scheme_frame(company_id, project, w, h, scale)
+    got = None if frame is None else frame[1:]
+    if len(_FRAME_CACHE) >= _FRAME_CACHE_MAX:
+        _FRAME_CACHE.clear()
+    _FRAME_CACHE[key] = got
+    return got
+
+
+def _scheme_frame(company_id, project, w=640, h=None, scale=2):
+    """-> (plots, w, h, zoom, clat, clon) or None.
+
+    ONE DEFINITION OF THE PICTURE'S GEOMETRY, USED BY BOTH SIDES.
+
+    The drawing needs it to place boundaries. The tap handler needs it to
+    work out what was tapped. If the two ever computed it separately and
+    drifted by one zoom level or a few pixels, every tap would quietly
+    resolve to the wrong plot and a buyer would be reading the analysis of
+    somebody else's land, which is the worst failure this product has. So
+    there is one function and both callers use it.
+    """
+    plots = _scheme_rings(company_id, project)
+    if not plots:
+        return None
+    lons = [p[0] for pl in plots for r in pl[1] for p in r]
+    lats = [p[1] for pl in plots for r in pl[1] for p in r]
+    if not lons:
+        return None
+    bbox = (min(lons), min(lats), max(lons), max(lats))
+    clat, clon = (bbox[1] + bbox[3]) / 2.0, (bbox[0] + bbox[2]) / 2.0
+    if h is None:
+        w, h, zoom = _frame_and_zoom(bbox, scale)
+    else:
+        zoom = _fit_zoom(bbox, w, h, scale)
+    return plots, w, h, zoom, clat, clon
+
+
+def _draw_scheme_map(company_id, project, w=640, h=None, scale=2,
+                     detail=False):
+    """Satellite base from Google, boundaries and numbers drawn on top.
+
+    h=None means "shaped like the land", which is the default for a reason
+    measured rather than guessed. See _frame_and_zoom.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        print("[imagery] Pillow not installed - falling back to pins. "
+              "Fix with: pip install Pillow", file=sys.stderr)
+        return None
+
+    frame = _scheme_frame(company_id, project, w, h, scale)
+    if not frame:
+        return None
+    plots, w, h, zoom, clat, clon = frame
+
+    # DETAIL: THE SAME GROUND, TWICE THE PIXELS.
+    #
+    # A picture you can zoom is only worth zooming if there is something
+    # underneath. At the fitting zoom a 450 m2 plot is thirteen pixels wide,
+    # so magnifying it in the browser magnifies the blur.
+    #
+    # One zoom level in doubles the pixels per metre. Doubling the frame at
+    # the same time keeps the coverage IDENTICAL, which is the property that
+    # matters: the tap handler works in fractions of the picture, so as long
+    # as both versions frame exactly the same ground, a tap means the same
+    # thing on either and there is nothing to keep in step.
+    #
+    # Google serves at most 640 a side, and the detail frame is twice a base
+    # frame that already fits inside 640, so it is exactly four tiles of the
+    # base size. No arithmetic about remainders, no seams to line up.
+    tiles_xy = None
+    if detail:
+        tiles_xy = (w, h)
+        zoom, w, h = zoom + 1, w * 2, h * 2
+
+    import io
+
+    def _fetch(cy, cx, tw, th):
+        url = (f"https://maps.googleapis.com/maps/api/staticmap"
+               f"?center={cy:.6f},{cx:.6f}&zoom={zoom}"
+               f"&size={tw}x{th}&scale={scale}&maptype=satellite"
+               f"&key={GOOGLE_KEY}")
+        try:
+            body, _ = _http_get(url)
+        except Exception as e:                                # noqa: BLE001
+            print(f"[imagery] scheme base map failed: {e}", file=sys.stderr)
+            return None
+        if len(body) < 2000:
+            peek = body[:300].decode("utf-8", "replace").replace("\n", " ")
+            print(f"[imagery] scheme base map is not an image. Google said: "
+                  f"{peek!r}", file=sys.stderr)
+            return None
+        return Image.open(io.BytesIO(body)).convert("RGBA")
+
+    if tiles_xy is None:
+        img = _fetch(clat, clon, w, h)
+        if img is None:
+            return None
+    else:
+        # Four quarters, each the size of the base frame. Every tile's centre
+        # is worked out in world pixels and turned back into a coordinate, so
+        # the quarters butt up exactly rather than approximately.
+        tw, th = tiles_xy
+        img = Image.new("RGBA", (w * scale, h * scale))
+        cx0, cy0 = _world_px(clat, clon, zoom, scale)
+        x0 = cx0 - (w * scale) / 2.0
+        y0 = cy0 - (h * scale) / 2.0
+        for row in range(2):
+            for col in range(2):
+                tx = x0 + (col + 0.5) * tw * scale
+                ty = y0 + (row + 0.5) * th * scale
+                tlat, tlon = _latlon_from_world(tx, ty, zoom, scale)
+                piece = _fetch(tlat, tlon, tw, th)
+                if piece is None:
+                    return None
+                img.paste(piece, (col * tw * scale, row * th * scale))
+    W, H = img.size
+    cx, cy = _world_px(clat, clon, zoom, scale)
+
+    def to_px(lon, lat):
+        x, y = _world_px(lat, lon, zoom, scale)
+        return (x - cx + W / 2.0, y - cy + H / 2.0)
+
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(overlay)
+
+    # Translucent fill so the ground stays readable through it, and a white
+    # outline because a coloured line disappears against vegetation.
+    for _ref, rings, _lx, _ly in plots:
+        for ring in rings:
+            pts = [to_px(pt[0], pt[1]) for pt in ring]
+            if len(pts) >= 3:
+                d.polygon(pts, fill=(107, 191, 138, 70))
+                d.line(pts + [pts[0]], fill=(255, 255, 255, 235), width=3)
+
+    # WHAT NUMBER IS DRAWN, AND WHETHER IT IS DRAWN AT ALL.
+    #
+    # This used to call _marker_label, which gives up after 35 plots. That cap
+    # is real, but it belongs to a GOOGLE STATIC MAP MARKER, which carries one
+    # character. This map is composited here with Pillow, where "412" costs
+    # exactly what "C" costs. The cap stopped applying the day the drawing
+    # moved server-side and nobody moved it; on Oak Grove it would have left
+    # 653 of 688 plots unnumbered under a caption promising the numbers match
+    # the list.
+    #
+    # The limit that does apply is the plot's size on screen. At a zoom that
+    # fits a 100-acre scheme into 640 points, a 450 m2 plot is about twenty
+    # pixels across, and a three-digit number does not fit in twenty pixels at
+    # any size a person can read. So the number is sized to its own plot and
+    # omitted when it will not fit. That is self-limiting in the right
+    # direction: a number appears only where it can be read, and where it
+    # cannot, its absence is honest. An unreadable smudge is not.
+    _font_cache = {}
+
+    def _font(px):
+        px = max(7, min(44, int(px)))
+        if px not in _font_cache:
+            f = None
+            for path in (r"C:\Windows\Fonts\arialbd.ttf",
+                         r"C:\Windows\Fonts\arial.ttf",
+                         "/usr/share/fonts/truetype/dejavu/"
+                         "DejaVuSans-Bold.ttf"):
+                try:
+                    f = ImageFont.truetype(path, px)
+                    break
+                except (OSError, IOError):
+                    continue
+            _font_cache[px] = f or ImageFont.load_default()
+        return _font_cache[px]
+
+    # EVERY PLOT GETS ITS NUMBER. 1, 2, 3, to the end of the scheme, whatever
+    # the plot's size. The floor used to be 11 and it silently skipped 444 of
+    # Oak Grove's 688, which put the map back in the same shape as everything
+    # else that went wrong on this scheme: a component quietly keeping what
+    # suited it. A small number is small. It is still the plot's number, and
+    # the reader can zoom.
+    #
+    # 7 is not a judgement about legibility, it is the smallest size the font
+    # renderer produces anything at. Only a plot with no measurable width at
+    # all falls through now.
+    floor = 7
+    ceiling = 26 if scale > 1 else 14
+
+    # ONE SIZE FOR EVERY NUMBER ON THE MAP.
+    #
+    # Sizing each number to its own plot was wrong, and not only because it
+    # looked untidy. Type size is read as emphasis. A 1.8-acre plot carrying a
+    # numeral three times the height of its neighbours tells the eye that plot
+    # matters more, and nothing about a plot's area makes its NUMBER more
+    # important. The map is an index. An index does not rank its entries.
+    #
+    # The size is still measured rather than hardcoded, because a thirteen-plot
+    # scheme and a 688-plot scheme need different numbers and neither should
+    # inherit the other's. Each plot's largest comfortable size is computed as
+    # before, and the map then uses one size for all of them: low enough in the
+    # distribution that it sits inside most plots, not the smallest, which
+    # would let a single sliver shrink the whole scheme to nothing.
+    measured = []
+
+    for n, (_ref, _rings, lx, ly) in enumerate(plots):
+        lab = str(n + 1)
+        if not _rings:
+            continue
+        ring = [to_px(pt[0], pt[1]) for pt in _rings[0] if len(pt) >= 2]
+        if len(ring) < 4:
+            continue
+
+        # HOW WIDE IS THIS PLOT, MEASURED HOW.
+        #
+        # The first version used the axis-aligned bounding box, and on this
+        # scheme that was wrong in the worst way: Oak Grove is laid out on a
+        # diagonal, so a long thin plot has a box that is large in BOTH
+        # directions. Every sliver was sized as though it were a square,
+        # and the render came back with "78" and "77" printed at forty
+        # pixels across plots eight pixels wide, spilling over their
+        # neighbours. Rotate a rectangle and its bounding box stops
+        # describing it.
+        #
+        # Area and perimeter do not care which way the plot is turned, and
+        # for a rectangle they RECOVER THE SIDES EXACTLY. The two sides sum
+        # to half the perimeter and multiply to the area, so they are the
+        # roots of t^2 - (P/2)t + A. A plot drawn at 45 degrees measures the
+        # same as one drawn square to the world.
+        #
+        # 2*area/perimeter was the first attempt and it is not the short
+        # side: for a 13 by 25 plot it returns 8.4. It only approaches the
+        # short side on something very much longer than it is wide, and a
+        # residential plot is not that, so every number came out a third too
+        # small and 199 of 200 fell below the legibility floor.
+        area2 = 0.0
+        perim = 0.0
+        for i in range(len(ring) - 1):
+            (ax, ay), (bx, by) = ring[i], ring[i + 1]
+            area2 += ax * by - bx * ay
+            perim += math.hypot(bx - ax, by - ay)
+        area = abs(area2) / 2.0
+        if area <= 0 or perim <= 0:
+            continue
+        half = perim / 2.0
+        disc = half * half - 4.0 * area
+        if disc >= 0:
+            root = math.sqrt(disc)
+            short, long_ = (half - root) / 2.0, (half + root) / 2.0
+        else:
+            # Not rectangle-like at all. A square of the same area is the
+            # honest fallback and never overstates the room available.
+            short = long_ = math.sqrt(area)
+        if short <= 0:
+            continue
+
+        # The glyphs are about 0.6 em wide, so a 3-digit number needs 1.8 ems
+        # of length. Height is capped at 0.8 of the short side so a number
+        # that fits sits inside its own boundary rather than on it.
+        fits = min(short * 0.8, long_ / (0.62 * len(lab)))
+        measured.append((lab, to_px(lx, ly), fits))
+
+    if not measured:
+        out = Image.alpha_composite(img, overlay).convert("RGB")
+        buf = io.BytesIO()
+        out.save(buf, format="JPEG", quality=88)
+        return buf.getvalue(), "image/jpeg"
+
+    # The 30th percentile: roughly seven plots in ten hold their number
+    # comfortably, and the narrow three in ten carry the same numeral slightly
+    # proud of their outline. Taking the minimum instead would let Oak Grove's
+    # thinnest sliver decide the type size for all 688, which is one plot
+    # setting the legibility of the whole scheme.
+    #
+    # NO PLOT IS SKIPPED for being too small. Dropping a plot is how a scheme
+    # quietly acquires holes, and a buyer standing on one of them has no way
+    # to look it up. A number that overhangs is readable and correct; a
+    # missing one is neither.
+    ranked = sorted(m[2] for m in measured)
+    size = int(max(floor, min(ceiling, ranked[int(len(ranked) * 0.30)])))
+    font = _font(size)
+
+    # A dark halo, because white-on-satellite is legible over grass and
+    # invisible over a tin roof. One size now, so one halo.
+    halo = 2 if size >= 20 else 1
+    rng = range(-halo, halo + 1)
+    for lab, (x, y), _fits in measured:
+        for ox in rng:
+            for oy in rng:
+                if ox or oy:
+                    d.text((x + ox, y + oy), lab, font=font,
+                           fill=(10, 20, 15, 220), anchor="mm")
+        d.text((x, y), lab, font=font, fill=(255, 255, 255, 255), anchor="mm")
+
+    out = Image.alpha_composite(img, overlay).convert("RGB")
+    buf = io.BytesIO()
+    out.save(buf, format="JPEG", quality=88)
+    return buf.getvalue(), "image/jpeg"
+
+
+def _updated_tag(company_id, ref=None, project=""):
+    """A short hash of when these parcels last changed.
+
+    It does TWO jobs and the second one was missing, which is why a rebuilt
+    map kept looking like the old one:
+
+      the cache FILENAME   so the server stops serving a picture of
+                           boundaries that have been superseded;
+      the image URL        so the BROWSER stops serving one. These responses
+                           carry Cache-Control: max-age=86400, which is right
+                           - a plot's satellite view does not change hourly -
+                           and it means a URL that never changes is a picture
+                           that never changes, for a day, no matter what the
+                           server does.
+
+    Fixing only the disk cache fixed nothing a person could see.
+    """
+    q = """SELECT coalesce(max(updated_at), now()) FROM land.parcels
+            WHERE company_id = :cid AND status = 'active'"""
+    params = {"cid": company_id}
+    if ref:
+        q += " AND parcel_ref = :ref"
+        params["ref"] = ref
+    else:
+        q += " AND (:proj = '' OR project_name = :proj)"
+        params["proj"] = project or ""
+    try:
+        with engine.connect() as conn:
+            stamp = conn.execute(text(q), params).scalar()
+        return hashlib.sha256(str(stamp).encode()).hexdigest()[:10]
+    except Exception:                                         # noqa: BLE001
+        return "nostamp"
+
+
+def _scheme_map_bytes(company_id, project, detail=False):
+    """Boundaries with numbers inside them, or pins if that is not possible.
+
+    The fallback is not decoration: Pillow may be absent, and a scheme whose
+    parcels have no usable rings would otherwise render nothing at all. A map
+    with pins is worse than a map with boundaries and much better than a gap
+    on a client's page.
     """
     if not GOOGLE_KEY:
         return None
+
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", project or "all")[:40]
     pts = _scheme_points(company_id, project)
     if not pts:
         return None
+
+    tag = _updated_tag(company_id, project=project)
+
+    # v3: the frame is no longer 16:9 and the numbers are no longer capped at
+    # 35, so every picture drawn before this change is wrong in a way _updated_tag
+    # cannot see. The tag tracks the DATA; the version tracks THE DRAWING, and
+    # a code change that alters the picture has to bust the cache itself or
+    # clients keep the old one for a day.
+    # The detail render is a separate file, not a replacement. The small one
+    # is what loads with the page and it has to stay quick; the big one is
+    # fetched only once somebody actually zooms.
+    kind = "detail" if detail else "fit"
+    cached = IMG_CACHE / f"scheme_v3_{kind}_{slug}_{len(pts)}_{tag}.jpg"
+    if cached.exists() and cached.stat().st_size > 0:
+        return cached.read_bytes(), "image/jpeg"
+
+    drawn = _draw_scheme_map(company_id, project, detail=detail)
+    if drawn:
+        IMG_CACHE.mkdir(parents=True, exist_ok=True)
+        cached.write_bytes(drawn[0])
+        return drawn
 
     marks = []
     for n, (_ref, lon, lat) in enumerate(pts):
@@ -691,55 +1292,282 @@ def _scheme_map_bytes(company_id, project):
         if lab:
             style += f"|label:{lab}"
         marks.append(f"markers={style}|{lat},{lon}")
-
     url = ("https://maps.googleapis.com/maps/api/staticmap"
            "?size=640x330&scale=2&maptype=hybrid&"
            + "&".join(marks) + f"&key={GOOGLE_KEY}")
-
-    # A URL this long is the real limit here, not the plot count. Google
-    # rejects requests past about 16,000 characters, so a very large scheme
-    # drops back to unlabelled pins, and past that it is simply not mapped.
     if len(url) > 15500:
         return None
-
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", project or "all")[:40]
-    return _cached_image(f"scheme_{slug}_{len(pts)}.jpg", url)
+    return _cached_image(f"scheme_pins_{slug}_{len(pts)}.jpg", url)
 
 
 @app.get("/v1/scheme/map")
 def scheme_map(request: Request, project: str = "", k: str = None,
-               x_api_key: str = Header(None)):
+               detail: int = 0, x_api_key: str = Header(None)):
     auth = guard(x_api_key or k, request)
-    got = _scheme_map_bytes(auth["company_id"], project)
+    got = _scheme_map_bytes(auth["company_id"], project, detail=bool(detail))
     if not got:
         raise HTTPException(404, "No map for this scheme.")
     return Response(content=got[0], media_type=got[1],
                     headers={"Cache-Control": "public, max-age=86400"})
 
 
-def index_html(rows, api_key="", project="", company_id=None):
+# How far outside a boundary a tap still counts, in metres on the ground.
+# Fingers are wider than plot boundaries: on a 688-plot scheme a plot is about
+# thirteen pixels across, so a tap aimed at one lands on the line between two
+# of them often enough to matter. Ten metres is roughly one plot width here,
+# close enough to forgive a near miss and far too small to jump a road.
+TAP_TOLERANCE_M = 10.0
+
+
+# ===========================================================================
+# THE ONE DOOR IN THE GEOMETRY FIREWALL
+#
+# report_content.assert_no_geometry() stands, unchanged, and every analysis
+# payload still goes through it. Nothing below weakens it. This is a separate,
+# narrow endpoint that is allowed to do the one thing that function forbids,
+# and it is written down here rather than discovered later by someone
+# wondering why the rule seems to have two answers.
+#
+# WHAT CHANGED AND WHY
+#   Njeri chose a live map over a picture, and there is no version of a live
+#   map where the browser does not know the shapes. Panning, zooming and
+#   clicking a plot all require the outlines client-side. The picture existed
+#   precisely to avoid that, and it is still there as the fallback.
+#
+# WHY THIS IS NOT THE THING A4 PROTECTS AGAINST
+#   A4 is about ODbL. The exposure is DISTRIBUTION of an OpenStreetMap-DERIVED
+#   database - above all environment.riparian_buffers, which is derived
+#   geometry and unambiguously a database. Hand a client that and share-alike
+#   attaches to us.
+#
+#   A seller's own plot outlines are not derived from anything of ours. They
+#   drew them, they sent us the KMZ, they publish the site plan, they run
+#   site visits to it every Saturday. Publishing them on that seller's own
+#   listing is what the listing is for.
+#
+# THE LINE, STATED SO IT CAN BE CHECKED
+#   leaves      the client's own parcel outlines, for that client's own key
+#   never       any layer we derived - soils, rainfall, buffers, amenities,
+#               anything from environment.* or analytics.* - in any form
+#
+#   The query below selects land.parcels.geom and nothing else. If it ever
+#   grows a join onto a derived table, that is the moment this stops being
+#   defensible, and it should be refused in review on those grounds alone.
+#
+# WHAT IT COSTS THE CLIENT, WHICH IS THEIR CALL AND NOT OURS
+#   A competitor can read the outlines out of the page. A seller should be
+#   told that plainly before it is switched on, and it is switched on by the
+#   presence of a browser key rather than silently for everyone.
+# ===========================================================================
+SCHEME_PLOTS_SQL = text("""
+    SELECT parcel_ref, listing_status,
+           ST_AsGeoJSON(geom, 6) AS g
+      FROM land.parcels
+     WHERE company_id = :cid AND status = 'active'
+       AND listing_status NOT IN ('hidden', 'cancelled')
+       AND (:proj = '' OR project_name = :proj)
+     ORDER BY project_name NULLS LAST, parcel_ref
+     LIMIT :lim""")
+
+
+@app.get("/v1/scheme/plots")
+def scheme_plots(request: Request, project: str = "", k: str = None,
+                 x_api_key: str = Header(None)):
+    """The outlines, for the live map. See the block above before editing.
+
+    Six decimal places is 0.11 m on the ground. The surveyor's own drawing is
+    not that precise, so this rounds away nothing real while roughly halving
+    what crosses the wire on a 688-plot scheme.
+
+    The ORDER is the same ORDER BY as index_rows and _scheme_rings, because
+    the number on a plot is its position in that list. Three queries now
+    depend on that single ordering, and any of them changing it silently
+    renumbers the scheme.
+    """
+    auth = guard(x_api_key or k, request)
+    if not GOOGLE_EMBED_KEY:
+        raise HTTPException(404, "No browser key configured.")
+
+    out, lo_lat, lo_lon, hi_lat, hi_lon = [], 90.0, 180.0, -90.0, -180.0
+    with engine.connect() as conn:
+        rows = conn.execute(SCHEME_PLOTS_SQL,
+                            {"cid": auth["company_id"], "proj": project or "",
+                             "lim": INDEX_MAX}).all()
+    for n, (ref, state, gj) in enumerate(rows, 1):
+        try:
+            g = json.loads(gj)
+        except (TypeError, ValueError):
+            continue
+        polys = ([g["coordinates"]] if g.get("type") == "Polygon"
+                 else g.get("coordinates", []))
+        rings = [p[0] for p in polys if p and p[0]]
+        if not rings:
+            continue
+        for lon, lat in rings[0]:
+            lo_lat, hi_lat = min(lo_lat, lat), max(hi_lat, lat)
+            lo_lon, hi_lon = min(lo_lon, lon), max(hi_lon, lon)
+        out.append({"n": n, "ref": ref, "state": state, "rings": rings})
+
+    if not out:
+        raise HTTPException(404, "No plots in this scheme.")
+    return {
+        "key": GOOGLE_EMBED_KEY,
+        "bounds": {"south": lo_lat, "west": lo_lon,
+                   "north": hi_lat, "east": hi_lon},
+        "plots": out,
+    }
+
+
+@app.get("/v1/scheme/at")
+def scheme_at(request: Request, x: float, y: float, project: str = "",
+              k: str = None, x_api_key: str = Header(None)):
+    """Which plot is at this point on the scheme picture?
+
+    WHY THE BROWSER ASKS INSTEAD OF KNOWING.
+
+    Making the map clickable the ordinary way means giving the page the shape
+    of every plot, as an image map or an overlay. That is the client's parcel
+    geometry published on the open internet, and it is exactly what B4 exists
+    to prevent.
+
+    So the page sends what it does know, which is where the finger landed as
+    a fraction of the picture, and gets back a single parcel reference. The
+    coordinates are reconstructed here from the same frame the drawing used,
+    and the database answers which parcel contains that point. Nothing about
+    any boundary crosses the wire in either direction.
+
+    The reply is a reference and nothing else. It is deliberately not the
+    plot's analysis: the browser then requests that through the same endpoint
+    a card click uses, so there is one path to a plot's detail rather than
+    two that can disagree.
+    """
+    auth = guard(x_api_key or k, request)
+    if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+        raise HTTPException(400, "x and y are fractions of the image, 0 to 1.")
+
+    frame = _scheme_frame_geometry(auth["company_id"], project)
+    if not frame:
+        raise HTTPException(404, "No map for this scheme.")
+    w, h, zoom, clat, clon = frame
+
+    scale = 2
+    cx, cy = _world_px(clat, clon, zoom, scale)
+    px = cx - (w * scale) / 2.0 + x * w * scale
+    py = cy - (h * scale) / 2.0 + y * h * scale
+    lat, lon = _latlon_from_world(px, py, zoom, scale)
+
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT parcel_ref
+              FROM land.parcels
+             WHERE company_id = :cid AND status = 'active'
+               AND listing_status NOT IN ('hidden', 'cancelled')
+               AND (:proj = '' OR project_name = :proj)
+               AND ST_Contains(geom, ST_SetSRID(ST_MakePoint(:lon, :lat), 4326))
+             LIMIT 1"""),
+            {"cid": auth["company_id"], "proj": project or "",
+             "lon": lon, "lat": lat}).one_or_none()
+
+        # A tap that lands on a boundary or a footpath belongs to the nearest
+        # plot, within one plot's width. Beyond that it belongs to nothing:
+        # returning the closest parcel to a tap in an empty field would show
+        # a buyer analysis for land they were not pointing at, and a tap that
+        # does nothing is the honest outcome.
+        if row is None:
+            row = conn.execute(text("""
+                SELECT parcel_ref
+                  FROM land.parcels
+                 WHERE company_id = :cid AND status = 'active'
+                   AND listing_status NOT IN ('hidden', 'cancelled')
+                   AND (:proj = '' OR project_name = :proj)
+                   AND ST_DWithin(geom::geography,
+                                  ST_SetSRID(ST_MakePoint(:lon, :lat),
+                                             4326)::geography, :tol)
+                 ORDER BY geom::geography <->
+                          ST_SetSRID(ST_MakePoint(:lon, :lat), 4326)::geography
+                 LIMIT 1"""),
+                {"cid": auth["company_id"], "proj": project or "",
+                 "lon": lon, "lat": lat, "tol": TAP_TOLERANCE_M}).one_or_none()
+
+    if row is None:
+        raise HTTPException(404, "No plot at that point.")
+    return {"ref": row[0]}
+
+
+def index_html(rows, api_key="", project="", company_id=None,
+               branding=None, total=None):
     if not rows:
         return ('<div class="giq"><div class="slot">'
                 'No plots are listed here yet.</div></div>')
 
     o = ['<div class="giq giq-ix"><style>', CSS, '</style>']
-    open_n = sum(1 for r in rows if r["state"] == "available")
+    o.append(seller_strip(branding or {}))
+    shown = len(rows)
+    total = shown if total is None else int(total)
+    more = max(0, total - shown)
     head = esc(project) if project else "All plots"
-    o.append(f'<div class="hd"><div><h3>{head}</h3>'
-             f'<p class="loc">{open_n} of {len(rows)} available</p></div></div>')
+
+    # WHAT THIS LINE MAY SAY.
+    #
+    # It used to read "{available} of {len(rows)} available", and with the
+    # page capped at 200 that second number was the page size wearing a
+    # total's clothes. On a 688-plot scheme it told a buyer the scheme had
+    # 200 plots. We do not print a number we cannot source, and the size of
+    # the scheme is exactly the kind of number a buyer repeats to a seller.
+    #
+    # So when the page is showing everything, it counts what is available.
+    # When it is not, it says so in the same breath, because a buyer who
+    # cannot see all the plots needs to know that more than we need the
+    # sentence to be tidy.
+    if more:
+        o.append(f'<div class="hd"><div><h3>{head}</h3>'
+                 f'<p class="loc">Showing {shown} of {total} plots</p>'
+                 f'</div></div>')
+    else:
+        open_n = sum(1 for r in rows if r["state"] == "available")
+        o.append(f'<div class="hd"><div><h3>{head}</h3>'
+                 f'<p class="loc">{open_n} of {total} available</p>'
+                 f'</div></div>')
 
     # THE MAP GOES FIRST. A buyer looking at a scheme wants to know where the
     # plots are before anything else, and the numbers on the pins are what
     # tie the picture to the list underneath.
-    if GOOGLE_KEY and company_id is not None:
+    # THE LIVE MAP, WHEN THERE IS A BROWSER KEY TO DRIVE IT.
+    #
+    # An empty container and nothing else: no outlines in the markup, no
+    # coordinates, no picture. The loader fills it from /v1/scheme/plots once
+    # the page is up. If Google fails to load, or the key is wrong, or the
+    # buyer is behind something that blocks it, the loader puts the drawn
+    # picture back in the same box. A scheme listing must never be a blank
+    # rectangle, whatever else has gone wrong.
+    if GOOGLE_EMBED_KEY and company_id is not None:
+        fb = f"?k={esc(api_key)}" if api_key else "?"
+        if project:
+            fb += f"&project={esc(project)}"
+        fb += f"&v={_updated_tag(company_id, project=project)}"
+        o.append(f'<div class="smap smaplive" data-giq-livemap '
+                 f'data-giq-project="{esc(project or "")}" '
+                 f'data-giq-fallback="/v1/scheme/map{fb}">'
+                 f'<div class="smapc">Loading the map</div></div>')
+    elif GOOGLE_KEY and company_id is not None:
         if _scheme_map_bytes(company_id, project):
             q = f"?k={esc(api_key)}" if api_key else "?"
             if project:
                 q += f"&project={esc(project)}"
+            q += f"&v={_updated_tag(company_id, project=project)}"
             # Clicking opens Google Maps centred on the scheme, where a buyer
             # can pan, zoom and switch to the road map. Centred on the first
             # plot, because that is the scheme's own ordering and any
             # computed centroid of a straggling scheme lands in a field.
+            # "Numbers match the list below" was true of five plots. On a
+            # scheme where a plot is twenty pixels wide, most plots carry no
+            # number, and a caption that promises one is a promise the picture
+            # does not keep. NUMBERED plots match; the caption now says only
+            # that, and says plainly when the map is not showing everything.
+            cap = "Drag to move, + and - to zoom, tap a plot to open it"
+            if more:
+                cap = (f"Drag, zoom, tap a plot. Showing the first {shown} "
+                       f"of {total}")
             pts = _scheme_points(company_id, project)
             open_link = ""
             if pts:
@@ -747,11 +1575,29 @@ def index_html(rows, api_key="", project="", company_id=None):
                 open_link = (f'<a class="smapo" href="{esc(_gmaps_view(lat0, lon0))}" '
                              f'target="_blank" rel="noopener noreferrer">'
                              f'Open in Google Maps</a>')
-            o.append(f'<div class="smap"><img loading="lazy" '
-                     f'alt="Map of the plots in this scheme" '
+            # data-giq-map is what the loader binds the tap to, and it carries
+            # the project so the tap is resolved against the same scheme the
+            # picture was drawn from. The <img> stays a plain image: no image
+            # map, no overlay, no coordinates in the markup.
+            # data-giq-detail is the same picture at twice the resolution,
+            # over exactly the same ground. The loader swaps it in the first
+            # time somebody zooms, so the page still loads with the small
+            # one and only pays for the big one if it is wanted.
+            o.append(f'<div class="smap"><img loading="lazy" data-giq-map '
+                     f'data-giq-project="{esc(project or "")}" '
+                     f'data-giq-detail="/v1/scheme/map{q}&detail=1" '
+                     f'alt="Map of the plots in this scheme. '
+                     f'Tap a plot to open it." '
                      f'src="/v1/scheme/map{q}">'
-                     f'<div class="smapc">Numbers match the list below'
-                     f'{open_link}</div></div>')
+                     f'<div class="smapz">'
+                     f'<button type="button" data-giq-zoom="in" '
+                     f'aria-label="Zoom in">+</button>'
+                     f'<button type="button" data-giq-zoom="out" '
+                     f'aria-label="Zoom out">&#8722;</button>'
+                     f'<button type="button" data-giq-zoom="reset" '
+                     f'aria-label="Fit the whole scheme">&#9633;</button>'
+                     f'</div>'
+                     f'<div class="smapc">{esc(cap)}{open_link}</div></div>')
 
     o.append('<div class="grid">')
     for n, r in enumerate(rows):
@@ -761,8 +1607,11 @@ def index_html(rows, api_key="", project="", company_id=None):
         # and inventing one would break their page.
         o.append(f'<button class="card{gone}" type="button" '
                  f'data-giq-plot="{esc(r["ref"])}">')
-        lab = _marker_label(n)
-        pin = f'<span class="pin">{lab}</span>' if lab else ""
+        # The same number the map draws. It used to be _marker_label, which
+        # runs out at 35, so on a large scheme the map would show "412" over a
+        # plot whose card carried no number at all. The badge and the map are
+        # one contract or they are noise.
+        pin = f'<span class="pin">{n + 1}</span>'
         o.append(f'<span class="cref">{pin}{esc(r["ref"])}</span>')
         o.append(f'<span class="pill{gone}">{esc(r["status"])}</span>')
         bits = [x for x in (r["size"], r["price"]) if x]
@@ -785,7 +1634,7 @@ DEMO_PAGE = BASE / "demo_page.html"
 
 
 @app.get("/demo", response_class=HTMLResponse)
-def demo(k: str = ""):
+def demo(k: str = "", site: str = ""):
     """A stand-in seller's page, served from this origin.
 
     It exists so that testing needs no file editing. Because the page comes
@@ -799,7 +1648,18 @@ def demo(k: str = ""):
     authenticated, because nothing here is data - it is scenery around two
     empty divs.
     """
-    if not DEMO_PAGE.exists():
+    page = DEMO_PAGE
+    if site:
+        # A per-prospect demo page. The file is picked by name, and the name
+        # is scrubbed to letters and digits first: this route is public and
+        # unauthenticated, so an unfiltered value here would let anyone read
+        # any file on the disk by asking for ../../.env.
+        safe = re.sub(r"[^A-Za-z0-9_-]", "", site)[:40]
+        cand = BASE / f"demo_{safe}.html"
+        if not safe or not cand.exists():
+            raise HTTPException(404, f"No demo page for '{site}'.")
+        page = cand
+    if not page.exists():
         raise HTTPException(404, "demo_page.html is missing.")
     if not k:
         return HTMLResponse(
@@ -808,7 +1668,7 @@ def demo(k: str = ""):
             "  /demo?k=pk_test_...\n\n"
             "Mint one with:  python mint_key.py --company \"ZZ TEST\""
             "</pre>", status_code=400)
-    html = DEMO_PAGE.read_text(encoding="utf-8").replace("{{KEY}}", esc(k))
+    html = page.read_text(encoding="utf-8").replace("{{KEY}}", esc(k))
     return HTMLResponse(html)
 
 
@@ -818,11 +1678,13 @@ def scheme_embed(request: Request, project: str = "", k: str = None,
     """Every plot this key can see, as a grid. The scheme-page half."""
     t0 = time.time()
     auth = guard(x_api_key or k, request)
-    rows = index_rows(auth["company_id"], project)
+    rows, total = index_rows(auth["company_id"], project)
     ms = int((time.time() - t0) * 1000)
     log_call(auth, request, 200, ms)
     return HTMLResponse(index_html(rows, x_api_key or k or "", project,
-                                   auth["company_id"]))
+                                   auth["company_id"],
+                                   fetch_branding(auth["company_id"]),
+                                   total=total))
 
 
 CSS = """
@@ -860,6 +1722,16 @@ CSS = """
 .giq .r b{font-weight:500}
 .giq .slot{background:var(--soft);border-top:1px solid var(--line);
  padding:26px 20px;text-align:center;color:var(--dim);font-size:13px}
+.giq .seller{--seller:var(--brand);display:flex;align-items:center;gap:10px;
+ flex-wrap:wrap;padding:9px 20px;background:var(--soft);
+ border-bottom:1px solid var(--line);border-left:3px solid var(--seller);
+ font-size:12px;color:var(--dim)}
+.giq .seller .slogo{height:22px;width:auto;max-width:120px;object-fit:contain;
+ display:block}
+.giq .seller .sname{font-weight:600;color:var(--ink)}
+.giq .seller .sby{margin-left:auto;letter-spacing:.05em;
+ text-transform:uppercase;font-size:10.5px;font-weight:650;
+ color:var(--brand);white-space:nowrap}
 .giq .imgs{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));
  gap:1px;background:var(--line);border-top:1px solid var(--line)}
 .giq .imgs .tile{display:block;margin:0;background:var(--bg);position:relative;
@@ -892,8 +1764,59 @@ CSS = """
  border-top:1px solid var(--line);background:var(--soft)}
 .giq .smap{position:relative;border-top:1px solid var(--line);
  border-bottom:1px solid var(--line);background:var(--soft)}
-.giq .smap img{display:block;width:100%;height:auto;aspect-ratio:64/33;
- object-fit:cover}
+/* NO FIXED ASPECT RATIO, AND NO object-fit:cover. The picture is now shaped
+   like the scheme (see _frame_and_zoom), and cover would crop a square site
+   back into a letterbox - throwing away the plots at the top and bottom,
+   which on Oak Grove is most of them. The server decides the shape; the page
+   shows what it was sent. */
+.giq .smap img{display:block;width:100%;height:auto}
+/* The scheme map is a window onto a bigger picture. overflow:hidden is what
+   makes it pan instead of pushing the client's page sideways, and
+   touch-action:none stops a phone reading a drag on it as a page scroll. */
+.giq .smap{overflow:hidden}
+.giq .smap img[data-giq-map]{cursor:grab;transform-origin:0 0;
+ touch-action:none;-webkit-user-select:none;user-select:none}
+.giq .smap img[data-giq-map].giq-drag{cursor:grabbing}
+.giq .smapz{position:absolute;top:10px;right:10px;display:flex;
+ flex-direction:column;gap:5px;z-index:2}
+.giq .smapz button{width:32px;height:32px;border:0;border-radius:6px;
+ background:rgba(12,22,16,.72);color:#fff;font-size:17px;line-height:1;
+ cursor:pointer;font-family:inherit;padding:0}
+.giq .smapz button:hover{background:rgba(12,22,16,.92)}
+/* The live map needs a height of its own: it has no image inside it to give
+   it one. Tall enough to read a scheme, capped so it never eats a phone. */
+.giq .smaplive{height:min(72vh,560px);background:var(--soft)}
+.giq .smaplive .gm-style img{max-width:none}
+.giq .smaplive .smapc{pointer-events:none}
+.giq .smaplive .smapc a{pointer-events:auto}
+/* The satellite / map switch on the plot page. */
+.giq .livet{position:absolute;top:10px;left:10px;display:flex;gap:0;z-index:2;
+ border-radius:6px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.3)}
+.giq .livet button{border:0;padding:7px 13px;font-size:11px;font-family:inherit;
+ letter-spacing:.04em;text-transform:uppercase;cursor:pointer;
+ background:rgba(255,255,255,.92);color:#1b3a2a}
+.giq .livet button.on{background:#14532d;color:#fff}
+/* The interactive map. A fixed aspect rather than a fixed height, so it is
+   not a letterbox slot on a phone and not a wall on a desktop. */
+.giq .live{position:relative;border-top:1px solid var(--line)}
+.giq .live iframe{display:block;width:100%;aspect-ratio:4/3;max-height:420px;
+ border:0}
+/* Every pane is the same shape, so switching between them does not make the
+   client's page jump by a couple of hundred pixels under the reader. */
+.giq .live [data-giq-pane]{position:relative}
+.giq .live [data-giq-pane] .tile{display:block;position:relative;
+ text-decoration:none}
+.giq .live [data-giq-pane] img{display:block;width:100%;aspect-ratio:4/3;
+ max-height:420px;object-fit:cover}
+.giq .live [data-giq-pane][hidden]{display:none}
+.giq .livec{padding:7px 12px;font-size:11px;letter-spacing:.05em;
+ text-transform:uppercase;color:var(--muted);background:var(--soft);
+ border-top:1px solid var(--line);display:flex;
+ justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+/* Attribution is a licence condition, not decoration. It is quiet but it is
+   never hidden, and it never gets display:none. */
+.giq .livec a{color:var(--muted);text-decoration:none;white-space:nowrap}
+.giq .livec a:hover{text-decoration:underline}
 .giq .smapc{position:absolute;left:0;right:0;bottom:0;padding:7px 12px;
  display:flex;justify-content:space-between;align-items:center;gap:10px;
  font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:#fff;
@@ -973,6 +1896,34 @@ def esc(v):
 # ===========================================================================
 
 GOOGLE_KEY = (os.getenv("GOOGLE_MAPS_KEY") or "").strip()
+
+# A SECOND KEY, AND WHY IT IS NOT OPTIONAL.
+#
+# GOOGLE_MAPS_KEY never leaves this server. Every picture is fetched here and
+# streamed to the browser, so the key stays behind the API and a stranger
+# cannot spend her Google credit with it. That is deliberate and it is why
+# the imagery is proxied at all.
+#
+# An embedded interactive map is different in kind: the iframe URL carries a
+# key and that URL sits in the page source of a public listing, where anyone
+# can read it. Putting GOOGLE_MAPS_KEY there would publish the key that bills
+# Static Maps and Street View on every plot page on the internet.
+#
+# So the interactive map uses its OWN key and there is no fallback to the
+# server key. If GOOGLE_MAPS_EMBED_KEY is unset the map simply does not
+# appear. In the Google Cloud console that key must be restricted to the Maps
+# Embed API only, and to the seller's domains. The Embed API is not billed,
+# so a restricted embed key that leaks costs nothing, which is the whole
+# point of separating them.
+GOOGLE_EMBED_KEY = ((os.getenv("GOOGLE_MAPS_BROWSER_KEY")
+                     or os.getenv("GOOGLE_MAPS_EMBED_KEY") or "").strip())
+if GOOGLE_EMBED_KEY and GOOGLE_EMBED_KEY == GOOGLE_KEY:
+    print("[imagery] GOOGLE_MAPS_EMBED_KEY is the same value as "
+          "GOOGLE_MAPS_KEY. Refusing to use it: that would publish the "
+          "billed key in every listing's page source. Create a second key "
+          "restricted to the Maps Embed API.", file=sys.stderr)
+    GOOGLE_EMBED_KEY = ""
+
 IMG_CACHE = BASE / "cache" / "img"
 IMG_TIMEOUT = 12
 
@@ -1147,7 +2098,33 @@ def _gmaps_dir(lat, lon):
 
 
 def _imagery_html(ref, api_key, company_id):
-    """The picture panel, or an honest placeholder."""
+    """ONE BOX. UP TO THREE VIEWS OF THE SAME PLACE. ONE SWITCH.
+
+    There used to be a still photograph and a movable map stacked on top of
+    each other, and Njeri's reaction was the correct one: there is no point
+    in there being two. They answer the same question, and a buyer had to
+    scroll past the first to reach the second and then wonder which one was
+    authoritative.
+
+    So the panel holds up to three views of the same ground and shows one at
+    a time:
+
+        Satellite   the imagery
+        Map         roads and place names, which is what tells you what is
+                    next door and how you would reach it
+        Street      the photograph from the nearest road, when there is one
+
+    Every pane is built up front and hidden, not fetched on demand. Switching
+    is then instant and, more importantly, an iframe that has already loaded
+    is not thrown away and reloaded every time somebody flicks between two
+    views to compare them.
+
+    WHICH SOURCE FILLS THE PANES DEPENDS ON WHETHER THERE IS AN EMBED KEY,
+    and the buyer should never be able to tell. With one, both map panes are
+    Google and both move. Without one, Satellite is our own still picture and
+    Map is OpenStreetMap, which moves but has no imagery. Same box, same
+    switch, same two labels.
+    """
     if not GOOGLE_KEY:
         return ('<div class="slot">Satellite view and Street View appear here '
                 'once a Google Maps key is configured.</div>')
@@ -1155,51 +2132,237 @@ def _imagery_html(ref, api_key, company_id):
     if not pt:
         return ""
     lon, lat = pt
-    q = f"?k={esc(api_key)}" if api_key else ""
+    v = _updated_tag(company_id, ref=ref)
+    q = (f"?k={esc(api_key)}&v={v}" if api_key else f"?v={v}")
     view = esc(_gmaps_view(lat, lon))
 
-    tiles = [f'<a class="tile" href="{view}" target="_blank" '
-             f'rel="noopener noreferrer">'
-             f'<img loading="lazy" alt="Satellite view of this plot" '
-             f'src="/v1/plots/{esc(ref)}/satellite{q}">'
-             f'<span class="cap">Satellite view '
-             f'<em>Open in Google Maps</em></span></a>']
+    tabs, panes, credit = [], [], ""
+
+    def tab(key, label, first):
+        cls = ' class="on"' if first else ''
+        tabs.append(f'<button type="button" data-giq-view="{key}"{cls}>'
+                    f'{label}</button>')
+
+    if GOOGLE_EMBED_KEY:
+        base = (f"https://www.google.com/maps/embed/v1/place"
+                f"?key={GOOGLE_EMBED_KEY}&q={lat:.6f},{lon:.6f}&zoom=17")
+        panes.append(
+            f'<div data-giq-pane="sat"><iframe src="{esc(base)}'
+            f'&maptype=satellite" loading="lazy" allowfullscreen '
+            f'referrerpolicy="no-referrer-when-downgrade" '
+            f'title="Satellite map around this plot"></iframe></div>')
+        panes.append(
+            f'<div data-giq-pane="map" hidden><iframe src="{esc(base)}'
+            f'&maptype=roadmap" loading="lazy" allowfullscreen '
+            f'referrerpolicy="no-referrer-when-downgrade" '
+            f'title="Street map around this plot"></iframe></div>')
+    else:
+        panes.append(
+            f'<div data-giq-pane="sat">'
+            f'<a class="tile" href="{view}" target="_blank" '
+            f'rel="noopener noreferrer">'
+            f'<img loading="lazy" alt="Satellite view of this plot" '
+            f'src="/v1/plots/{esc(ref)}/satellite{q}">'
+            f'<span class="cap">Satellite view '
+            f'<em>Open in Google Maps</em></span></a></div>')
+        # About 400 m each way, which is the scale at which a buyer is asking
+        # "what is next to it" rather than "where in Kenya is it".
+        d = 0.0035
+        osm = (f"https://www.openstreetmap.org/export/embed.html"
+               f"?bbox={lon - d:.6f},{lat - d:.6f},{lon + d:.6f},{lat + d:.6f}"
+               f"&layer=mapnik&marker={lat:.6f},{lon:.6f}")
+        panes.append(
+            f'<div data-giq-pane="map" hidden><iframe src="{esc(osm)}" '
+            f'loading="lazy" allowfullscreen '
+            f'referrerpolicy="no-referrer-when-downgrade" '
+            f'title="Street map around this plot"></iframe></div>')
+        # Attribution is a licence condition of using their embed. It stays
+        # visible whichever pane is open, because working out which pane is
+        # showing in order to hide a credit is effort spent in the wrong
+        # direction.
+        credit = ('<a href="https://www.openstreetmap.org/copyright" '
+                  'target="_blank" rel="noopener noreferrer">'
+                  'Map data \u00a9 OpenStreetMap contributors</a>')
+
+    tab("sat", "Satellite", True)
+    tab("map", "Map", False)
+
     if _streetview_ok(ref, lat, lon):
         sv = esc(f"https://www.google.com/maps/@?api=1&map_action=pano"
                  f"&viewpoint={lat:.6f},{lon:.6f}")
-        tiles.append(f'<a class="tile" href="{sv}" target="_blank" '
-                     f'rel="noopener noreferrer">'
-                     f'<img loading="lazy" alt="Street view near this plot" '
-                     f'src="/v1/plots/{esc(ref)}/streetview{q}">'
-                     f'<span class="cap">Nearest street view '
-                     f'<em>Walk around it</em></span></a>')
-    return '<div class="imgs">' + "".join(tiles) + '</div>'
+        panes.append(
+            f'<div data-giq-pane="street" hidden>'
+            f'<a class="tile" href="{sv}" target="_blank" '
+            f'rel="noopener noreferrer">'
+            f'<img loading="lazy" alt="Street view near this plot" '
+            f'src="/v1/plots/{esc(ref)}/streetview{q}">'
+            f'<span class="cap">Nearest street view '
+            f'<em>Walk around it</em></span></a></div>')
+        tab("street", "Street", False)
+
+    return (f'<div class="live">'
+            f'<div class="livet">{"".join(tabs)}</div>'
+            f'{"".join(panes)}'
+            f'<div class="livec">Drag the map to see what is around the plot'
+            f'{credit}</div></div>')
 
 
-def _actions_html(ref, company_id):
-    """Get directions, for real this time.
+def _actions_html(ref, company_id, branding=None):
+    """Get directions, and the seller's own call to action.
 
-    On a phone this opens the Google Maps app with the plot as destination
-    and the buyer's own position as origin, which is exactly what somebody
-    reading a land listing on a matatu is trying to do.
+    On a phone the directions link opens the Google Maps app with the plot as
+    destination and the buyer's own position as origin, which is exactly what
+    somebody reading a land listing on a matatu is trying to do.
     """
+    b = branding or {}
     pt = _parcel_point(company_id, ref) if ref else None
-    o = ['<div class="acts">']
+    rows = []
     if pt:
         lon, lat = pt
-        o.append(f'<a class="p" href="{esc(_gmaps_dir(lat, lon))}" '
-                 f'target="_blank" rel="noopener noreferrer">Get directions</a>')
-    # "Book a site visit" stays inert until a client tells us where it should
-    # go - their form, their WhatsApp, their phone. Inventing a destination
-    # would be worse than an obvious placeholder, and clients.branding is
-    # where it will live.
-    o.append('<a href="#">Book a site visit</a>')
-    o.append('</div>')
-    return "".join(o)
+        rows.append(f'<a class="p" href="{esc(_gmaps_dir(lat, lon))}" '
+                    f'target="_blank" rel="noopener noreferrer">'
+                    f'Get directions</a>')
+
+    # THE BUTTON EXISTS ONLY WHEN IT WORKS.
+    #
+    # It pointed at "#" from the day the listing view was built, which was
+    # right while there was nowhere for it to go, and becomes a defect the
+    # moment a real seller's buyer clicks it. There is now no state in which
+    # it is present and dead: no site_visit_url, no button.
+    if b.get("visit"):
+        rows.append(f'<a href="{esc(b["visit"])}" target="_blank" '
+                    f'rel="noopener noreferrer">Book a site visit</a>')
+
+    if not rows:
+        return ""
+    return '<div class="acts">' + "".join(rows) + '</div>'
 
 
-def listing_html(rep, footer="", api_key="", company_id=None):
+# ===========================================================================
+# BRANDING - THE SELLER'S NAME ON THE PLOT, NOT ON THE ANALYSIS
+#
+# THE DECISION THIS IMPLEMENTS
+#   The widget could blend into a seller's site - their colours, their fonts,
+#   indistinguishable from their own copy. It sells better that way, and it
+#   is the wrong choice.
+#
+#   The product is an INDEPENDENT assessment. A buyer reading "this soil may
+#   be black cotton, get a test before you agree a budget" needs to see that
+#   the seller did not write it. A panel styled entirely by the seller is a
+#   panel the buyer reads as the seller's own marketing, and then the caution
+#   is worth nothing - which is also exactly why section 2 keeps the verdicts
+#   off a seller's page in the first place.
+#
+#   So: the seller's identity appears, prominently, attached to THE PLOT.
+#   The analysis keeps Geocode's own face.
+#
+# WHAT THE SELLER CONTROLS AND WHAT THEY DO NOT
+#   logo_url, primary_color   the "listed by" strip only
+#   site_visit_url            where their own call-to-action goes
+#   report_footer             their wording in the footer
+#   the analysis panel        nothing. Not the colours, not the words.
+#
+#   primary_color deliberately does not reach the score dial, the answers or
+#   the cards. A seller who can restyle the assessment will eventually
+#   restyle it to look like approval.
+#
+# EVERY VALUE HERE IS CLIENT-CONTROLLED AND GOES INTO HTML OR CSS
+#   So each is validated against a whitelist rather than escaped and hoped
+#   for. A colour that is not a hex colour, or a URL whose scheme is not
+#   expected, is DROPPED - the element is omitted and the panel renders
+#   without it. `esc()` protects the text; these checks protect the
+#   attributes, which is where escaping alone is not enough.
+# ===========================================================================
+
+_HEX = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+_ACTION_SCHEMES = ("https://", "http://", "tel:", "mailto:")
+
+
+def safe_color(v):
+    """A hex colour, or nothing. Never anything else near a style attribute."""
+    v = (v or "").strip()
+    return v if _HEX.match(v) else None
+
+
+def safe_img_url(v):
+    """https only.
+
+    An http image on an https page is blocked as mixed content, so the tag
+    would render as a broken icon on every client site served over TLS -
+    which is all of them. Omitting it is better: the company name is always
+    rendered beside the logo, so this degrades to text.
+    """
+    v = (v or "").strip()
+    return v if v.lower().startswith("https://") else None
+
+
+def safe_action_url(v):
+    """A link scheme a browser will follow and a person intended.
+
+    javascript: and data: are the reason this is a whitelist and not a
+    blacklist. This value comes from a row a client can influence, and it
+    lands in an href.
+    """
+    v = (v or "").strip()
+    return v if any(v.lower().startswith(s) for s in _ACTION_SCHEMES) else None
+
+
+def fetch_branding(company_id):
+    """-> dict of validated, render-ready branding. Never raises."""
+    blank = {"name": None, "logo": None, "accent": None, "footer": "",
+             "visit": None}
+    if company_id is None:
+        return blank
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT c.name, b.logo_url, b.primary_color, b.report_footer,
+                       b.site_visit_url
+                  FROM clients.companies c
+                  LEFT JOIN clients.branding b ON b.company_id = c.company_id
+                 WHERE c.company_id = :c
+                 LIMIT 1"""), {"c": company_id}).one_or_none()
+    except Exception as e:                                    # noqa: BLE001
+        # site_visit_url is absent until v1.12 is applied. A widget that dies
+        # because a migration has not run yet is worse than one without a
+        # button, so this degrades instead of failing.
+        print(f"[branding] {e}", file=sys.stderr)
+        return blank
+    if not row:
+        return blank
+    return {"name": row[0],
+            "logo": safe_img_url(row[1]),
+            "accent": safe_color(row[2]),
+            "footer": row[3] or "",
+            "visit": safe_action_url(row[4])}
+
+
+def seller_strip(b):
+    """Nothing. Kept as a function on purpose - see below.
+
+    This used to render "Listed by <seller>" beside "Independent analysis by
+    Geocode". Njeri removed both, and the reasoning is hers to make: the
+    widget sits on the seller's own site, under the seller's own name, so
+    "listed by" repeats what the page already said, and the Geocode line puts
+    our branding on their listing without being asked.
+
+    IT IS STILL A FUNCTION, and every caller still calls it, because the
+    alternative is deleting the calls and rediscovering the whole question
+    the first time a client asks to be credited. Making it return nothing is
+    one line to reverse. Ripping it out is an afternoon.
+
+    Worth writing down for whoever revisits it: the independence line was not
+    decoration. An assessment carried on a seller's page is worth more to a
+    buyer if it plainly is not the seller's, and that line was what said so.
+    If it comes back, that is why.
+    """
+    return ""
+
+
+def listing_html(rep, footer="", api_key="", company_id=None, branding=None):
+    b = branding if branding is not None else {"name": None}
     o = ['<div class="giq"><style>', CSS, '</style>']
+    o.append(seller_strip(b))
 
     # ---- header: identity, and the score if this plot has one -------------
     o.append('<div class="hd"><div>')
@@ -1290,7 +2453,7 @@ def listing_html(rep, footer="", api_key="", company_id=None):
 
     # ---- imagery + actions -------------------------------------------------
     o.append(_imagery_html(rep.get("ref"), api_key, company_id))
-    o.append(_actions_html(rep.get("ref"), company_id))
+    o.append(_actions_html(rep.get("ref"), company_id, b))
 
     # ---- the rest of the scheme -------------------------------------------
     sch = rep.get("scheme") or []
